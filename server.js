@@ -211,6 +211,21 @@ function combineGEX(spxGEX, spyGEX) {
     prevStrike = s.strike;
   }
 
+  // Fallback 1: use SPX flip directly (most reliable single source)
+  if (!flipPoint && spxGEX && spxGEX.flipPoint) {
+    flipPoint = spxGEX.flipPoint;
+  }
+
+  // Fallback 2: strike where cumulative GEX is closest to zero
+  if (!flipPoint && strikes.length) {
+    var runningGEX2 = 0, closestFlip = null, closestDiff = Infinity;
+    for (var fi = 0; fi < strikes.length; fi++) {
+      runningGEX2 += strikes[fi].netGEX;
+      if (Math.abs(runningGEX2) < closestDiff) { closestDiff = Math.abs(runningGEX2); closestFlip = strikes[fi].strike; }
+    }
+    flipPoint = closestFlip;
+  }
+
   const netGEXBillions = parseFloat((totalGEX / 1e9).toFixed(2));
   let regime, regimeColor, regimeDesc;
   if      (totalGEX > 2e9)  { regime = 'STRONG PIN'; regimeColor = '#39ff14'; regimeDesc = 'Dealers long gamma — range-bound, fades work'; }
