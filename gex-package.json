@@ -1,0 +1,14 @@
+{
+  "name": "gex-scanner",
+  "version": "1.0.0",
+  "description": "Standalone GEX / Gamma Exposure scanner — SPX + SPY",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "node-cron": "^3.0.0",
+    "node-fetch": "^2.6.9",
+    "dotenv": "^16.0.0"
+  }
+}
