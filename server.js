@@ -391,11 +391,20 @@ ${d ? `
         <div class="mono" style="font-size:36px;font-weight:700;color:#d8eaf5">${d.spotPrice}</div>
       </div>
       <div>
-        <div style="font-size:11px;color:#4a6070;letter-spacing:2px;margin-bottom:4px">GEX FLIP</div>
+        <div style="font-size:11px;color:#4a6070;letter-spacing:2px;margin-bottom:4px">SPX FLIP</div>
         <div class="mono" style="font-size:36px;font-weight:700;color:#ffd166">${d.flipPoint || 'N/A'}</div>
+        ${d.flipPoint ? `<div style="font-size:11px;color:#4a6070;margin-top:2px">${d.flipPoint > d.spotPrice ? '+' : ''}${(d.flipPoint - d.spotPrice).toFixed(0)} pts away</div>` : ''}
+      </div>
+      <div>
+        <div style="font-size:11px;color:#4a6070;letter-spacing:2px;margin-bottom:4px">SPY FLIP</div>
+        <div class="mono" style="font-size:36px;font-weight:700;color:#ffd166">${(d.spyGEX && d.spyGEX.flipPoint) ? d.spyGEX.flipPoint : 'N/A'}</div>
+        ${(d.spyGEX && d.spyGEX.flipPoint && d.spyGEX.spotPrice) ? `<div style="font-size:11px;color:#4a6070;margin-top:2px">${d.spyGEX.flipPoint > d.spyGEX.spotPrice ? '+' : ''}${(d.spyGEX.flipPoint - d.spyGEX.spotPrice).toFixed(0)} pts away</div>` : ''}
       </div>
     </div>
-    <div style="padding:12px 16px;background:#111820;border-left:3px solid ${esc(d.regimeColor)};border-radius:0 6px 6px 0;font-size:13px;color:#8aa0b0">${esc(d.regimeDesc)}</div>
+    <div style="padding:12px 16px;background:#111820;border-left:3px solid ${esc(d.regimeColor)};border-radius:0 6px 6px 0;font-size:13px;color:#8aa0b0">
+      ${esc(d.regimeDesc)}
+      ${d.flipPoint ? ` &middot; Flip at <strong style="color:#ffd166">${d.flipPoint}</strong> (${Math.abs(d.flipPoint - d.spotPrice).toFixed(0)} pts ${d.flipPoint > d.spotPrice ? 'above' : 'below'} spot)` : ''}
+    </div>
   </div>
 </div>
 
