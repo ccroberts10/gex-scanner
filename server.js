@@ -487,7 +487,8 @@ function recalcPM() {
     if (d.error) { msg.textContent = 'Error: ' + d.error; msg.style.color='#ff2d55'; return; }
     msg.textContent = 'Done — ' + d.runLabel; msg.style.color = '#39ff14';
 
-    var gapPct = ${d ? `((spot - ${d.spotPrice}) / ${d.spotPrice} * 100).toFixed(2)` : '0'};
+    var closePrice = d.spxGEX && d.spxGEX.spotPrice ? d.spxGEX.spotPrice : (d.spotPrice || spot);
+    var gapPct = ((spot - closePrice) / closePrice * 100).toFixed(2);
     var gapDir = gapPct >= 0 ? 'GAP UP' : 'GAP DOWN';
     var gapCol = gapPct >= 0 ? '#39ff14' : '#ff2d55';
     var flipAbove = d.flipPoint && spot < d.flipPoint;
@@ -634,6 +635,7 @@ http.createServer(async function(req, res) {
         recalcData.ts         = new Date().toLocaleString('en-US', { timeZone: 'America/Denver', hour12: true });
         recalcData.runLabel   = 'Pre-Market @ ' + spot;
         recalcData.premarket  = true;
+        recalcData.originalClose = gexData.spotPrice;
 
         // Re-sort support/resistance relative to new spot
         const byMag = recalcData.strikes.slice().sort(function(a, b) { return b.magnitude - a.magnitude; });
