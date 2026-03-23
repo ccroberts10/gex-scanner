@@ -12,9 +12,10 @@ catch(e) { fetch = global.fetch; }
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 const CONFIG = {
-  tradierToken:  (process.env.TRADIER_TOKEN  || '').replace(/^["']|["']$/g, '').trim(),
-  pushoverUser:  (process.env.PUSHOVER_USER_KEY  || '').replace(/^["']|["']$/g, '').trim(),
-  pushoverToken: (process.env.PUSHOVER_APP_TOKEN || '').replace(/^["']|["']$/g, '').trim(),
+  tradierToken:    (process.env.TRADIER_TOKEN      || '').replace(/^["']|["']$/g, '').trim(),
+  pushoverUser:    (process.env.PUSHOVER_USER_KEY  || '').replace(/^["']|["']$/g, '').trim(),
+  pushoverToken:   (process.env.PUSHOVER_APP_TOKEN || '').replace(/^["']|["']$/g, '').trim(),
+  anthropicKey:    (process.env.ANTHROPIC_API_KEY  || '').replace(/^["']|["']$/g, '').trim(),
 };
 const PORT = process.env.PORT || 8081;
 
@@ -241,6 +242,62 @@ function combineGEX(spxGEX, spyGEX) {
   };
 }
 
+// ─── AI RECAP ────────────────────────────────────────────────────────────────
+async function generateGEXRecap(data) {
+  if (!CONFIG.anthropicKey) { log('warn', 'No ANTHROPIC_API_KEY — skipping AI recap'); return; }
+  try {
+    const spot     = data.spotPrice;
+    const flip     = data.flipPoint || 'unknown';
+    const spyFlip  = data.spyGEX && data.spyGEX.flipPoint ? data.spyGEX.flipPoint : null;
+    const ptsToFlip = data.flipPoint ? (data.flipPoint - spot).toFixed(0) : null;
+
+    const supportStr = (data.topSupport || []).slice(0, 4).map(function(s) {
+      return s.strike + ' ($' + Math.round(s.netGEX / 1e6) + 'M)';
+    }).join(', ');
+    const resistStr = (data.topResistance || []).slice(0, 4).map(function(s) {
+      return s.strike + ' ($' + Math.round(s.netGEX / 1e6) + 'M)';
+    }).join(', ');
+
+    const prompt = [
+      'You are a derivatives market analyst. Based on this GEX (Gamma Exposure) data, write a brief trading recap.',
+      '',
+      'GEX DATA:',
+      'Regime: ' + data.regime + ' (' + data.regimeDesc + ')',
+      'Net GEX: ' + (data.netGEXBillions >= 0 ? '+' : '') + data.netGEXBillions + 'B',
+      'SPX Spot: ' + spot,
+      'SPX GEX Flip Point: ' + flip + (ptsToFlip ? ' (' + (ptsToFlip > 0 ? '+' : '') + ptsToFlip + ' pts from spot)' : ''),
+      spyFlip ? 'SPY GEX Flip: ' + spyFlip + ' (SPX equiv ~' + Math.round(spyFlip * 10) + ')' : '',
+      'Key Resistance above spot: ' + (resistStr || 'none'),
+      'Key Support below spot: ' + (supportStr || 'none'),
+      '',
+      'Write exactly 4 sentences. No bullet points. Plain English only.',
+      'Sentence 1: What the regime and net GEX mean for todays session character (trending vs pinning).',
+      'Sentence 2: Where the key resistance levels are and what happens if price reaches them.',
+      'Sentence 3: Where the key support levels are and what happens if those break.',
+      'Sentence 4 (ACTIONABLE): One specific, direct trading instruction for today based on this data. Name price levels. Be blunt.',
+    ].filter(Boolean).join('\n');
+
+    const ctrl = new AbortController();
+    const tid  = setTimeout(function() { ctrl.abort(); }, 20000);
+    const res  = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': CONFIG.anthropicKey, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: 'claude-haiku-4-5-20251001', max_tokens: 300,
+        messages: [{ role: 'user', content: prompt }] }),
+      signal: ctrl.signal,
+    });
+    clearTimeout(tid);
+    const json = await res.json();
+    const text = json.content && json.content[0] && json.content[0].text ? json.content[0].text.trim() : null;
+    if (text) {
+      data.aiRecap = text;
+      log('ok', 'GEX AI recap generated');
+    }
+  } catch(e) {
+    log('warn', 'GEX AI recap failed: ' + e.message);
+  }
+}
+
 async function runGEXScan(label) {
   if (gexRunning) { log('warn', 'GEX already running'); return; }
   if (!CONFIG.tradierToken) { log('warn', 'No TRADIER_TOKEN'); return; }
@@ -269,6 +326,9 @@ async function runGEXScan(label) {
     gexLastRun = new Date().toISOString();
 
     log('ok', '== GEX complete — ' + combined.regime + ' | flip: ' + combined.flipPoint + ' | net: ' + combined.netGEXBillions + 'B ==');
+
+    // AI Recap
+    await generateGEXRecap(combined);
 
     // Pushover
     const spot = combined.spotPrice;
@@ -407,6 +467,24 @@ ${d ? `
     </div>
   </div>
 </div>
+
+${d.aiRecap ? `
+<!-- AI RECAP -->
+<div class="card" style="margin-bottom:16px">
+  <div class="card-head">
+    <span class="card-title">&#129302; AI Interpretation &amp; Actionable Takeaway</span>
+    <span style="font-size:11px;color:#4a6070">${esc(d.ts || '')}</span>
+  </div>
+  <div style="padding:18px 20px">
+    <div style="font-size:13px;color:#d8eaf5;line-height:1.9">${(function() {
+      var sentences = d.aiRecap.split(/(?<=[.!?])\s+/);
+      var last = sentences.pop();
+      return sentences.map(function(s) { return esc(s); }).join(' ') +
+        (last ? ' <div style="margin-top:14px;padding:12px 16px;background:#111820;border-left:3px solid #00d4ff;border-radius:0 6px 6px 0;font-size:13px;font-weight:600;color:#00d4ff">' + esc(last) + '</div>' : '');
+    })()}</div>
+  </div>
+</div>
+` : ''}
 
 <!-- KEY LEVELS -->
 <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
