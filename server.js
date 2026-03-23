@@ -334,6 +334,26 @@ nav{border-bottom:1px solid #1a2535;padding:0 24px;display:flex;align-items:cent
 </nav>
 <div class="wrap">
 
+<!-- PRE-MARKET PANEL -->
+<div class="card" style="margin-bottom:16px">
+  <div class="card-head">
+    <span class="card-title">&#9728; Pre-Market Recalculator</span>
+    <span style="font-size:11px;color:#4a6070">Enter futures/pre-market SPX price to recalculate levels</span>
+  </div>
+  <div style="padding:16px 20px;display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
+    <div>
+      <div style="font-size:10px;color:#4a6070;letter-spacing:1px;margin-bottom:6px">SPX PRE-MARKET PRICE</div>
+      <input type="number" id="pm-price" placeholder="e.g. 6540" step="1" min="1000" max="20000"
+        style="background:#111820;border:1px solid #1a2535;color:#d8eaf5;padding:9px 13px;font-family:'Space Mono',monospace;font-size:16px;font-weight:700;width:160px;border-radius:6px;outline:none"
+        onkeydown="if(event.key==='Enter')recalcPM()">
+    </div>
+    <button class="btn bp" onclick="recalcPM()" style="margin-bottom:1px">&#8635; Recalculate</button>
+    <button class="btn bs" onclick="clearPM()" style="margin-bottom:1px">Clear</button>
+    <span id="pm-msg" style="font-size:12px;color:#4a6070"></span>
+  </div>
+  <div id="pm-result"></div>
+</div>
+
 ${d ? `
 <!-- REGIME CARD -->
 <div class="card">
@@ -455,6 +475,79 @@ ${d ? `
 
 </div>
 <script>
+function recalcPM() {
+  var spot = parseFloat(document.getElementById('pm-price').value);
+  var msg  = document.getElementById('pm-msg');
+  var res  = document.getElementById('pm-result');
+  if (!spot || spot < 1000 || spot > 20000) { msg.textContent = 'Enter a valid SPX price (e.g. 6540)'; msg.style.color='#ff2d55'; return; }
+  msg.textContent = 'Recalculating...'; msg.style.color = '#00d4ff';
+  fetch('/api/recalc', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ spotPrice: spot }) })
+  .then(function(r) { return r.json(); })
+  .then(function(d) {
+    if (d.error) { msg.textContent = 'Error: ' + d.error; msg.style.color='#ff2d55'; return; }
+    msg.textContent = 'Done — ' + d.runLabel; msg.style.color = '#39ff14';
+
+    var gapPct = ${d ? `((spot - ${d.spotPrice}) / ${d.spotPrice} * 100).toFixed(2)` : '0'};
+    var gapDir = gapPct >= 0 ? 'GAP UP' : 'GAP DOWN';
+    var gapCol = gapPct >= 0 ? '#39ff14' : '#ff2d55';
+    var flipAbove = d.flipPoint && spot < d.flipPoint;
+
+    var supportRows = (d.topSupport || []).slice().reverse().map(function(s) {
+      var pct = ((s.strike - spot) / spot * 100).toFixed(1);
+      return '<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #0d1f2d">' +
+        '<span class="mono" style="color:#ff2d55;font-weight:700">' + s.strike + '</span>' +
+        '<span style="color:#4a6070;font-size:11px">' + pct + '%</span>' +
+        '<span class="mono" style="color:#ff2d55;font-size:11px">$' + Math.round(s.netGEX/1e6) + 'M</span>' +
+      '</div>';
+    }).join('');
+
+    var resistRows = (d.topResistance || []).map(function(s) {
+      var pct = ((s.strike - spot) / spot * 100).toFixed(1);
+      return '<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #0d1f2d">' +
+        '<span class="mono" style="color:#39ff14;font-weight:700">' + s.strike + '</span>' +
+        '<span style="color:#4a6070;font-size:11px">+' + pct + '%</span>' +
+        '<span class="mono" style="color:#39ff14;font-size:11px">+$' + Math.round(s.netGEX/1e6) + 'M</span>' +
+      '</div>';
+    }).join('');
+
+    res.innerHTML =
+      '<div style="padding:16px 20px;border-top:1px solid #1a2535;background:#070a0f">' +
+        '<div style="display:flex;gap:20px;flex-wrap:wrap;margin-bottom:16px">' +
+          '<div style="padding:12px 16px;background:#111820;border-radius:8px;border-left:3px solid ' + d.regimeColor + '">' +
+            '<div style="font-size:10px;color:#4a6070;letter-spacing:1px;margin-bottom:4px">REGIME @ ' + spot + '</div>' +
+            '<div class="mono" style="font-size:22px;font-weight:700;color:' + d.regimeColor + '">' + d.regime + '</div>' +
+            '<div style="font-size:11px;color:#8aa0b0;margin-top:4px">' + d.regimeDesc + '</div>' +
+          '</div>' +
+          '<div style="padding:12px 16px;background:#111820;border-radius:8px;border-left:3px solid #ffd166">' +
+            '<div style="font-size:10px;color:#4a6070;letter-spacing:1px;margin-bottom:4px">GEX FLIP</div>' +
+            '<div class="mono" style="font-size:22px;font-weight:700;color:#ffd166">' + (d.flipPoint || 'N/A') + '</div>' +
+            '<div style="font-size:11px;color:#8aa0b0;margin-top:4px">' + (flipAbove ? 'Spot BELOW flip — negative gamma' : 'Spot ABOVE flip — positive gamma') + '</div>' +
+          '</div>' +
+          '<div style="padding:12px 16px;background:#111820;border-radius:8px;border-left:3px solid ' + gapCol + '">' +
+            '<div style="font-size:10px;color:#4a6070;letter-spacing:1px;margin-bottom:4px">VS CLOSE</div>' +
+            '<div class="mono" style="font-size:22px;font-weight:700;color:' + gapCol + '">' + (gapPct >= 0 ? '+' : '') + gapPct + '%</div>' +
+            '<div style="font-size:11px;color:#8aa0b0;margin-top:4px">' + gapDir + ' from close</div>' +
+          '</div>' +
+        '</div>' +
+        '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">' +
+          '<div>' +
+            '<div style="font-size:10px;color:#39ff14;letter-spacing:2px;margin-bottom:8px">&#9650; RESISTANCE ABOVE ' + spot + '</div>' +
+            (resistRows || '<div style="color:#4a6070;font-size:12px">None in range</div>') +
+          '</div>' +
+          '<div>' +
+            '<div style="font-size:10px;color:#ff2d55;letter-spacing:2px;margin-bottom:8px">&#9660; SUPPORT BELOW ' + spot + '</div>' +
+            (supportRows || '<div style="color:#4a6070;font-size:12px">None in range</div>') +
+          '</div>' +
+        '</div>' +
+      '</div>';
+  })
+  .catch(function(e) { msg.textContent = 'Failed: ' + e.message; msg.style.color='#ff2d55'; });
+}
+function clearPM() {
+  document.getElementById('pm-price').value = '';
+  document.getElementById('pm-result').innerHTML = '';
+  document.getElementById('pm-msg').textContent = '';
+}
 function triggerScan(btn) {
   btn.disabled = true; btn.textContent = 'Scanning...';
   fetch('/api/scan', { method: 'POST' }).then(function() {
@@ -495,6 +588,70 @@ http.createServer(async function(req, res) {
     res.end(JSON.stringify(gexData || { loading: true }));
     return;
   }
+  if (req.method === 'POST' && url === '/api/recalc') {
+    let body = '';
+    req.on('data', function(d) { body += d; });
+    req.on('end', async function() {
+      try {
+        const { spotPrice } = JSON.parse(body);
+        const spot = parseFloat(spotPrice);
+        if (!spot || isNaN(spot) || spot < 1000 || spot > 20000) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Invalid spot price' }));
+          return;
+        }
+        if (!gexData || !gexData.spxGEX || !gexData.spyGEX) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'No GEX data yet — run a scan first' }));
+          return;
+        }
+        log('info', 'Pre-market recalc at spot: ' + spot);
+
+        // Recalculate using cached contracts but new spot price
+        // We re-run combineGEX with the new spot as reference
+        const spxGEX2 = Object.assign({}, gexData.spxGEX, { spotPrice: spot });
+        const spySpot2 = spot / 10; // SPY is ~1/10 SPX
+        const spyGEX2  = Object.assign({}, gexData.spyGEX, { spotPrice: spySpot2 });
+
+        // Refilter strikes within 20% of new spot
+        const filterStrikes = function(strikes, newSpot) {
+          return strikes.filter(function(s) {
+            return Math.abs(s.strike - newSpot) / newSpot <= 0.20;
+          });
+        };
+
+        spxGEX2.strikes = filterStrikes(gexData.spxGEX.strikes, spot);
+        spyGEX2.strikes = filterStrikes(gexData.spyGEX.strikes, spySpot2);
+
+        const recalcData = combineGEX(spxGEX2, spyGEX2);
+        if (!recalcData) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Recalc failed' }));
+          return;
+        }
+
+        recalcData.spotPrice  = spot;
+        recalcData.ts         = new Date().toLocaleString('en-US', { timeZone: 'America/Denver', hour12: true });
+        recalcData.runLabel   = 'Pre-Market @ ' + spot;
+        recalcData.premarket  = true;
+
+        // Re-sort support/resistance relative to new spot
+        const byMag = recalcData.strikes.slice().sort(function(a, b) { return b.magnitude - a.magnitude; });
+        recalcData.topResistance = byMag.filter(function(s) { return s.netGEX > 0 && s.strike >= spot; }).slice(0, 5);
+        recalcData.topSupport    = byMag.filter(function(s) { return s.netGEX < 0 && s.strike <= spot; }).slice(0, 5);
+        recalcData.topLevels     = byMag.slice(0, 10);
+
+        log('ok', 'Pre-market recalc done — regime: ' + recalcData.regime + ' flip: ' + recalcData.flipPoint + ' spot: ' + spot);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(recalcData));
+      } catch(e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
   if (req.method === 'POST' && url === '/api/test-push') {
     const result = await sendPushover('GEX Test', 'Pushover working for GEX Scanner!', 0);
     res.writeHead(200, { 'Content-Type': 'application/json' });
