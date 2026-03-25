@@ -234,9 +234,83 @@ function combineGEX(spxGEX, spyGEX) {
   else if (totalGEX > -2e9) { regime = 'MILD TREND'; regimeColor = '#ff6b35'; regimeDesc = 'Trending possible — breakouts can extend'; }
   else                       { regime = 'TRENDING';   regimeColor = '#ff2d55'; regimeDesc = 'Dealers short gamma — volatile, trending session'; }
 
+  // ── Near-spot strikes: all strikes within 3% of spot ──────────────────────
+  const nearSpotStrikes = strikes.filter(function(s) {
+    return Math.abs(s.strike - spotPrice) / spotPrice <= 0.03;
+  }).sort(function(a, b) { return a.strike - b.strike; });
+
+  // ── Control band detection ─────────────────────────────────────────────────
+  // Find the largest cluster of consecutive positive GEX strikes near spot
+  // A cluster = consecutive strikes (within 25pts of each other) all positive GEX
+  const controlBands = [];
+  let currentBand = null;
+  const posStrikes = strikes.filter(function(s) { return s.netGEX > 0; })
+    .sort(function(a, b) { return a.strike - b.strike; });
+
+  for (var ci = 0; ci < posStrikes.length; ci++) {
+    const s = posStrikes[ci];
+    if (!currentBand) {
+      currentBand = { low: s.strike, high: s.strike, totalGEX: s.netGEX, strikes: [s] };
+    } else if (s.strike - currentBand.high <= 25) {
+      currentBand.high = s.strike;
+      currentBand.totalGEX += s.netGEX;
+      currentBand.strikes.push(s);
+    } else {
+      if (currentBand.strikes.length >= 2) controlBands.push(currentBand);
+      currentBand = { low: s.strike, high: s.strike, totalGEX: s.netGEX, strikes: [s] };
+    }
+  }
+  if (currentBand && currentBand.strikes.length >= 2) controlBands.push(currentBand);
+
+  // Sort by total GEX magnitude, pick top 3
+  controlBands.sort(function(a, b) { return b.totalGEX - a.totalGEX; });
+  const topControlBands = controlBands.slice(0, 3).map(function(b) {
+    return {
+      low: b.low, high: b.high,
+      totalGEX: Math.round(b.totalGEX),
+      totalGEXB: parseFloat((b.totalGEX / 1e9).toFixed(2)),
+      strikeCount: b.strikes.length,
+      nearSpot: Math.abs(((b.low + b.high) / 2) - spotPrice) / spotPrice <= 0.05,
+      aboveSpot: b.low > spotPrice,
+      belowSpot: b.high < spotPrice,
+      label: b.low === b.high ? String(b.low) : b.low + '-' + b.high,
+    };
+  });
+
+  // ── Negative GEX clusters (air pockets / acceleration zones) ──────────────
+  const negStrikes = strikes.filter(function(s) { return s.netGEX < 0; })
+    .sort(function(a, b) { return a.strike - b.strike; });
+  const negBands = [];
+  let currentNeg = null;
+  for (var ni = 0; ni < negStrikes.length; ni++) {
+    const s = negStrikes[ni];
+    if (!currentNeg) {
+      currentNeg = { low: s.strike, high: s.strike, totalGEX: s.netGEX, strikes: [s] };
+    } else if (s.strike - currentNeg.high <= 25) {
+      currentNeg.high = s.strike;
+      currentNeg.totalGEX += s.netGEX;
+      currentNeg.strikes.push(s);
+    } else {
+      if (currentNeg.strikes.length >= 2) negBands.push(currentNeg);
+      currentNeg = { low: s.strike, high: s.strike, totalGEX: s.netGEX, strikes: [s] };
+    }
+  }
+  if (currentNeg && currentNeg.strikes.length >= 2) negBands.push(currentNeg);
+  negBands.sort(function(a, b) { return a.totalGEX - b.totalGEX; }); // most negative first
+  const topNegBands = negBands.slice(0, 2).map(function(b) {
+    return {
+      low: b.low, high: b.high,
+      totalGEX: Math.round(b.totalGEX),
+      totalGEXB: parseFloat((b.totalGEX / 1e9).toFixed(2)),
+      strikeCount: b.strikes.length,
+      label: b.low === b.high ? String(b.low) : b.low + '-' + b.high,
+    };
+  });
+
   return {
     spotPrice, totalGEX: Math.round(totalGEX), netGEXBillions, regime, regimeColor, regimeDesc, flipPoint,
-    strikes, topSupport: byMag.filter(function(s) { return s.netGEX < 0 && s.strike <= spotPrice; }).slice(0, 5),
+    strikes, nearSpotStrikes, topControlBands, topNegBands,
+    topSupport: byMag.filter(function(s) { return s.netGEX < 0 && s.strike <= spotPrice; }).slice(0, 5),
     topResistance: byMag.filter(function(s) { return s.netGEX > 0 && s.strike >= spotPrice; }).slice(0, 5),
     topLevels: byMag.slice(0, 10), spxGEX, spyGEX,
   };
@@ -530,6 +604,83 @@ ${d.aiRecap ? `
     </div>
   </div>
 </div>
+
+${(d.topControlBands && d.topControlBands.length) ? `
+<!-- CONTROL BANDS -->
+<div class="card" style="margin-bottom:16px">
+  <div class="card-head">
+    <span class="card-title">&#127919; Control Bands &amp; Air Pockets</span>
+    <span style="font-size:11px;color:#4a6070">Clusters of consecutive strikes — where market gets pinned or accelerates</span>
+  </div>
+  <div style="padding:16px 20px">
+    <div style="font-size:10px;color:#39ff14;letter-spacing:2px;margin-bottom:10px">POSITIVE GEX BANDS — PINNING / SUPPORT / RESISTANCE</div>
+    <div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:20px">
+      ${(d.topControlBands || []).map(function(b) {
+        var pos  = b.aboveSpot ? 'ABOVE SPOT' : b.belowSpot ? 'BELOW SPOT' : 'AT SPOT';
+        var col  = b.nearSpot ? '#39ff14' : '#ffd166';
+        var role = b.aboveSpot ? 'RESISTANCE / CAP' : b.belowSpot ? 'SUPPORT / FLOOR' : 'CONTROL ZONE';
+        return `<div style="padding:14px 16px;background:#111820;border-radius:8px;border-left:4px solid ${col};min-width:160px;flex:1">
+          <div style="font-size:10px;color:#4a6070;letter-spacing:1px;margin-bottom:4px">${pos} — ${role}</div>
+          <div class="mono" style="font-size:22px;font-weight:700;color:${col}">${b.label}</div>
+          <div class="mono" style="font-size:14px;color:${col};margin-top:2px">+${b.totalGEXB}B combined</div>
+          <div style="font-size:10px;color:#4a6070;margin-top:4px">${b.strikeCount} strikes in cluster</div>
+        </div>`;
+      }).join('')}
+    </div>
+    ${(d.topNegBands && d.topNegBands.length) ? `
+    <div style="font-size:10px;color:#ff2d55;letter-spacing:2px;margin-bottom:10px">NEGATIVE GEX BANDS — AIR POCKETS / ACCELERATION ZONES</div>
+    <div style="display:flex;flex-wrap:wrap;gap:10px">
+      ${(d.topNegBands || []).map(function(b) {
+        return `<div style="padding:14px 16px;background:#111820;border-radius:8px;border-left:4px solid #ff2d55;min-width:160px;flex:1">
+          <div style="font-size:10px;color:#4a6070;letter-spacing:1px;margin-bottom:4px">AIR POCKET — MOVES ACCELERATE HERE</div>
+          <div class="mono" style="font-size:22px;font-weight:700;color:#ff2d55">${b.label}</div>
+          <div class="mono" style="font-size:14px;color:#ff2d55;margin-top:2px">${b.totalGEXB}B combined</div>
+          <div style="font-size:10px;color:#4a6070;margin-top:4px">${b.strikeCount} strikes in cluster</div>
+        </div>`;
+      }).join('')}
+    </div>
+    ` : ''}
+  </div>
+</div>
+` : ''}
+
+${(d.nearSpotStrikes && d.nearSpotStrikes.length) ? `
+<!-- NEAR SPOT DETAIL -->
+<div class="card" style="margin-bottom:16px">
+  <div class="card-head">
+    <span class="card-title">&#128269; Strike-by-Strike — Within 3% of Spot (${d.spotPrice})</span>
+    <span style="font-size:11px;color:#4a6070">Every strike with GEX data near current price</span>
+  </div>
+  <div style="overflow-x:auto">
+    <table style="width:100%;border-collapse:collapse;font-family:Space Mono,monospace;font-size:12px">
+      <tr style="color:#4a6070;font-size:10px;letter-spacing:1px;border-bottom:1px solid #1a2535">
+        <td style="padding:8px 16px">STRIKE</td>
+        <td style="padding:8px 16px">NET GEX</td>
+        <td style="padding:8px 16px">CALL OI</td>
+        <td style="padding:8px 16px">PUT OI</td>
+        <td style="padding:8px 16px">VS SPOT</td>
+        <td style="padding:8px 16px">ROLE</td>
+      </tr>
+      ${(d.nearSpotStrikes || []).map(function(s) {
+        var col     = s.netGEX >= 0 ? '#39ff14' : '#ff2d55';
+        var gexM    = Math.round(s.netGEX / 1e6);
+        var pct     = ((s.strike - d.spotPrice) / d.spotPrice * 100).toFixed(1);
+        var isSpot  = Math.abs(s.strike - d.spotPrice) <= 5;
+        var role    = isSpot ? 'AT SPOT' : s.netGEX > 0 && s.strike > d.spotPrice ? 'RESISTANCE' : s.netGEX > 0 && s.strike < d.spotPrice ? 'SUPPORT' : s.strike > d.spotPrice ? 'AIR POCKET ↑' : 'AIR POCKET ↓';
+        var rowBg   = isSpot ? 'background:rgba(0,212,255,0.06)' : '';
+        return `<tr style="border-bottom:1px solid #0d1f2d;${rowBg}">
+          <td style="padding:8px 16px;color:#d8eaf5;font-weight:700">${s.strike}${isSpot ? ' <span style="color:#00d4ff;font-size:9px">◀ SPOT</span>' : ''}</td>
+          <td style="padding:8px 16px;color:${col};font-weight:700">${gexM >= 0 ? '+' : ''}$${gexM}M</td>
+          <td style="padding:8px 16px;color:#8aa0b0">${(s.callOI || 0).toLocaleString()}</td>
+          <td style="padding:8px 16px;color:#8aa0b0">${(s.putOI  || 0).toLocaleString()}</td>
+          <td style="padding:8px 16px;color:#4a6070">${pct >= 0 ? '+' : ''}${pct}%</td>
+          <td style="padding:8px 16px;color:${col};font-size:10px;letter-spacing:1px">${role}</td>
+        </tr>`;
+      }).join('')}
+    </table>
+  </div>
+</div>
+` : ''}
 
 <!-- GEX BAR CHART -->
 <div class="card">
