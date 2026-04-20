@@ -332,8 +332,25 @@ async function generateGEXRecap(data) {
       return s.strike + ' ($' + Math.round(s.netGEX / 1e6) + 'M)';
     }).join(', ');
 
+    // Pull CTA data if available to enrich the prompt
+    var ctaContext = '';
+    try {
+      if (ctaState && ctaState.composite !== null && ctaState.composite !== undefined) {
+        var spyTrig = (ctaState.triggers || []).slice(0, 2).map(function(t) {
+          return t.lookback + 'd MA at $' + t.level + ' (' + (t.distancePct >= 0 ? '+' : '') + t.distancePct + '%, ~$' + t.estimatedFlowB + 'B flow if broken)';
+        }).join('; ');
+        ctaContext = [
+          '',
+          'CTA (Trend-Follower) POSITIONING:',
+          'Composite Score: ' + (ctaState.composite > 0 ? '+' : '') + ctaState.composite + ' (' + ctaState.compositeState + ')',
+          'Interpretation: ' + ctaState.interpretation,
+          'Nearest SPY Triggers: ' + (spyTrig || 'none'),
+        ].join('\n');
+      }
+    } catch(e) { /* ignore, just skip CTA context */ }
+
     const prompt = [
-      'You are a derivatives market analyst. Based on this GEX (Gamma Exposure) data, write a brief trading recap.',
+      'You are a derivatives market analyst. Based on this GEX (Gamma Exposure) AND CTA positioning data, write a brief trading recap.',
       '',
       'GEX DATA:',
       'Regime: ' + data.regime + ' (' + data.regimeDesc + ')',
@@ -343,12 +360,14 @@ async function generateGEXRecap(data) {
       spyFlip ? 'SPY GEX Flip: ' + spyFlip + ' (SPX equiv ~' + Math.round(spyFlip * 10) + ')' : '',
       'Key Resistance above spot: ' + (resistStr || 'none'),
       'Key Support below spot: ' + (supportStr || 'none'),
+      ctaContext,
       '',
-      'Write exactly 4 sentences. No bullet points. Plain English only.',
-      'Sentence 1: What the regime and net GEX mean for todays session character (trending vs pinning).',
+      'Write exactly 5 sentences. No bullet points. Plain English only.',
+      'Sentence 1: What the GEX regime and net GEX mean for todays session character (trending vs pinning).',
       'Sentence 2: Where the key resistance levels are and what happens if price reaches them.',
       'Sentence 3: Where the key support levels are and what happens if those break.',
-      'Sentence 4 (ACTIONABLE): One specific, direct trading instruction for today based on this data. Name price levels. Be blunt.',
+      'Sentence 4: What CTA positioning adds to the picture - are they crowded, and how do their nearest trigger levels interact with GEX levels? Call out if GEX and CTA levels AGREE (double-confirmed) or DISAGREE (acceleration risk).',
+      'Sentence 5 (ACTIONABLE): One specific, direct trading instruction for today that integrates both signals. Name price levels. Be blunt.',
     ].filter(Boolean).join('\n');
 
     const ctrl = new AbortController();
@@ -356,7 +375,7 @@ async function generateGEXRecap(data) {
     const res  = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': CONFIG.anthropicKey, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: 'claude-haiku-4-5-20251001', max_tokens: 300,
+      body: JSON.stringify({ model: 'claude-haiku-4-5-20251001', max_tokens: 400,
         messages: [{ role: 'user', content: prompt }] }),
       signal: ctrl.signal,
     });
