@@ -824,11 +824,11 @@ function renderCTASection() {
     const arrow = t.direction === 'sell_trigger' ? '&#9660;' : '&#9650;';
     const label = t.direction === 'sell_trigger' ? 'BREAK = FORCED SELLING' : 'BREAK = FORCED BUYING';
     return `<div style="padding:12px 20px;border-bottom:1px solid #0d1f2d;display:grid;grid-template-columns:80px 1fr 90px 100px 110px;gap:12px;align-items:center">
-      <div style="font-size:11px;color:#4a6070;letter-spacing:1px">\${t.lookback}-DAY MA</div>
-      <div class="mono" style="font-size:18px;font-weight:700;color:#d8eaf5">$\${t.level}</div>
-      <div class="mono" style="font-size:13px;color:\${distCol};text-align:right">\${t.distancePct >= 0 ? '+' : ''}\${t.distancePct}%</div>
-      <div class="mono" style="font-size:12px;color:#ffd166;text-align:right">~$\${t.estimatedFlowB}B</div>
-      <div style="font-size:9px;color:\${distCol};letter-spacing:1px;text-align:right">\${arrow} \${label}</div>
+      <div style="font-size:11px;color:#4a6070;letter-spacing:1px">${t.lookback}-DAY MA</div>
+      <div class="mono" style="font-size:18px;font-weight:700;color:#d8eaf5">$${t.level}</div>
+      <div class="mono" style="font-size:13px;color:${distCol};text-align:right">${t.distancePct >= 0 ? '+' : ''}${t.distancePct}%</div>
+      <div class="mono" style="font-size:12px;color:#ffd166;text-align:right">~$${t.estimatedFlowB}B</div>
+      <div style="font-size:9px;color:${distCol};letter-spacing:1px;text-align:right">${arrow} ${label}</div>
     </div>`;
   }).join('');
 
@@ -843,52 +843,52 @@ function renderCTASection() {
     const colorFor = function(v) { if (v === null || v === undefined) return '#4a6070'; if (v > 1) return '#39ff14'; if (v < -1) return '#ff2d55'; return '#ffd166'; };
     const fmtPct  = function(v) { return v === null || v === undefined ? '-' : (v > 0 ? '+' : '') + v.toFixed(2) + '%'; };
     return `<tr style="border-bottom:1px solid #0d1f2d">
-      <td style="padding:9px 16px;color:#00d4ff;font-weight:700;font-family:'Space Mono',monospace">\${a.symbol}</td>
-      <td style="padding:9px 16px;color:#8aa0b0;font-size:12px">\${a.name}</td>
-      <td style="padding:9px 16px;color:#4a6070;font-size:11px;letter-spacing:1px">\${a.assetClass.toUpperCase()}</td>
-      <td style="padding:9px 16px;color:\${posCol};font-weight:700;font-family:'Space Mono',monospace;text-align:right">\${a.positionPct >= 0 ? '+' : ''}\${a.positionPct}</td>
-      <td style="padding:9px 16px;color:\${posCol};font-size:10px;letter-spacing:1px;text-align:right">\${a.state.toUpperCase()}</td>
-      <td style="padding:9px 16px;color:\${colorFor(m20)};text-align:right;font-family:'Space Mono',monospace;font-size:11px">\${fmtPct(m20)}</td>
-      <td style="padding:9px 16px;color:\${colorFor(m50)};text-align:right;font-family:'Space Mono',monospace;font-size:11px">\${fmtPct(m50)}</td>
-      <td style="padding:9px 16px;color:\${colorFor(m200)};text-align:right;font-family:'Space Mono',monospace;font-size:11px">\${fmtPct(m200)}</td>
+      <td style="padding:9px 16px;color:#00d4ff;font-weight:700;font-family:'Space Mono',monospace">${a.symbol}</td>
+      <td style="padding:9px 16px;color:#8aa0b0;font-size:12px">${a.name}</td>
+      <td style="padding:9px 16px;color:#4a6070;font-size:11px;letter-spacing:1px">${a.assetClass.toUpperCase()}</td>
+      <td style="padding:9px 16px;color:${posCol};font-weight:700;font-family:'Space Mono',monospace;text-align:right">${a.positionPct >= 0 ? '+' : ''}${a.positionPct}</td>
+      <td style="padding:9px 16px;color:${posCol};font-size:10px;letter-spacing:1px;text-align:right">${a.state.toUpperCase()}</td>
+      <td style="padding:9px 16px;color:${colorFor(m20)};text-align:right;font-family:'Space Mono',monospace;font-size:11px">${fmtPct(m20)}</td>
+      <td style="padding:9px 16px;color:${colorFor(m50)};text-align:right;font-family:'Space Mono',monospace;font-size:11px">${fmtPct(m50)}</td>
+      <td style="padding:9px 16px;color:${colorFor(m200)};text-align:right;font-family:'Space Mono',monospace;font-size:11px">${fmtPct(m200)}</td>
     </tr>`;
   }).join('');
 
-  const errorBox = (d.errors && d.errors.length) ? `<div style="margin:0 20px 16px 20px;padding:10px 14px;background:rgba(255,45,85,0.08);border-left:3px solid #ff2d55;font-size:11px;color:#ff6b35;font-family:'Space Mono',monospace">\${d.errors.map(function(e) { return '· ' + e; }).join('<br>')}</div>` : '';
+  const errorBox = (d.errors && d.errors.length) ? `<div style="margin:0 20px 16px 20px;padding:10px 14px;background:rgba(255,45,85,0.08);border-left:3px solid #ff2d55;font-size:11px;color:#ff6b35;font-family:'Space Mono',monospace">${d.errors.map(function(e) { return '· ' + e; }).join('<br>')}</div>` : '';
 
   return `<div class="card">
   <div class="card-head">
     <span class="card-title">&#128202; CTA Positioning -- Trend-Follower Flow</span>
-    <span style="font-size:11px;color:#4a6070">\${d.ts || ''} &middot; \${d.universeFetched}/\${d.universe} assets</span>
+    <span style="font-size:11px;color:#4a6070">${d.ts || ''} &middot; ${d.universeFetched}/${d.universe} assets</span>
   </div>
   <div style="padding:24px">
     <div style="display:flex;align-items:center;gap:24px;flex-wrap:wrap;margin-bottom:20px">
       <div>
         <div style="font-size:11px;color:#4a6070;letter-spacing:2px;margin-bottom:4px">COMPOSITE SCORE</div>
-        <div class="mono" style="font-size:36px;font-weight:700;color:\${compColor}">\${d.composite > 0 ? '+' : ''}\${d.composite}</div>
+        <div class="mono" style="font-size:36px;font-weight:700;color:${compColor}">${d.composite > 0 ? '+' : ''}${d.composite}</div>
       </div>
       <div>
         <div style="font-size:11px;color:#4a6070;letter-spacing:2px;margin-bottom:4px">REGIME</div>
-        <div class="mono" style="font-size:18px;font-weight:700;color:\${compColor};text-transform:uppercase">\${d.compositeState}</div>
+        <div class="mono" style="font-size:18px;font-weight:700;color:${compColor};text-transform:uppercase">${d.compositeState}</div>
       </div>
       <div>
         <div style="font-size:11px;color:#4a6070;letter-spacing:2px;margin-bottom:4px">1D &Delta;</div>
-        <div class="mono" style="font-size:22px;font-weight:700;color:#d8eaf5">\${d.compositeDelta1d !== null ? (d.compositeDelta1d > 0 ? '+' : '') + d.compositeDelta1d : '&mdash;'}</div>
+        <div class="mono" style="font-size:22px;font-weight:700;color:#d8eaf5">${d.compositeDelta1d !== null ? (d.compositeDelta1d > 0 ? '+' : '') + d.compositeDelta1d : '&mdash;'}</div>
       </div>
       <div>
         <div style="font-size:11px;color:#4a6070;letter-spacing:2px;margin-bottom:4px">1W &Delta;</div>
-        <div class="mono" style="font-size:22px;font-weight:700;color:#d8eaf5">\${d.compositeDelta1w !== null ? (d.compositeDelta1w > 0 ? '+' : '') + d.compositeDelta1w : '&mdash;'}</div>
+        <div class="mono" style="font-size:22px;font-weight:700;color:#d8eaf5">${d.compositeDelta1w !== null ? (d.compositeDelta1w > 0 ? '+' : '') + d.compositeDelta1w : '&mdash;'}</div>
       </div>
       <div style="margin-left:auto"><button class="btn bs" onclick="refreshCTA(this)">&#8635; Refresh CTA</button></div>
     </div>
     <div style="position:relative;height:24px;background:#070a0f;border-radius:4px;overflow:hidden;margin-bottom:14px">
       <div style="position:absolute;left:50%;top:0;bottom:0;width:1px;background:#1a2535"></div>
-      <div style="position:absolute;top:0;bottom:0;width:\${barFill}%;\${barSide};background:\${compColor};opacity:0.85;border-radius:3px"></div>
+      <div style="position:absolute;top:0;bottom:0;width:${barFill}%;${barSide};background:${compColor};opacity:0.85;border-radius:3px"></div>
     </div>
     <div style="display:flex;justify-content:space-between;font-size:10px;color:#4a6070;letter-spacing:1px;margin-bottom:16px">
       <span>MAX SHORT -100</span><span>NEUTRAL 0</span><span>+100 MAX LONG</span>
     </div>
-    <div style="padding:12px 16px;background:#111820;border-left:3px solid \${compColor};border-radius:0 6px 6px 0;font-size:13px;color:#8aa0b0">\${d.interpretation}</div>
+    <div style="padding:12px 16px;background:#111820;border-left:3px solid ${compColor};border-radius:0 6px 6px 0;font-size:13px;color:#8aa0b0">${d.interpretation}</div>
   </div>
 </div>
 <div class="card">
@@ -896,7 +896,7 @@ function renderCTASection() {
     <span class="card-title">&#127919; SPY Trigger Ladder -- Forced Flow Levels</span>
     <span style="font-size:11px;color:#4a6070">Sorted by proximity to current price</span>
   </div>
-  <div>\${triggerRows || '<div style="padding:30px;text-align:center;color:#4a6070;font-size:12px">No trigger data</div>'}</div>
+  <div>${triggerRows || '<div style="padding:30px;text-align:center;color:#4a6070;font-size:12px">No trigger data</div>'}</div>
 </div>
 <div class="card">
   <div class="card-head">
@@ -911,10 +911,10 @@ function renderCTASection() {
         <td style="padding:8px 16px;text-align:right">STATE</td><td style="padding:8px 16px;text-align:right">vs 20D</td>
         <td style="padding:8px 16px;text-align:right">vs 50D</td><td style="padding:8px 16px;text-align:right">vs 200D</td>
       </tr>
-      \${assetRows}
+      ${assetRows}
     </table>
   </div>
-  \${errorBox}
+  ${errorBox}
 </div>`;
 }
 
