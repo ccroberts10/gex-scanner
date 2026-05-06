@@ -124,10 +124,17 @@ async function fetchChainForGEX(symbol) {
       'https://api.tradier.com/v1/markets/options/expirations?symbol=' + symbol + '&includeAllRoots=true',
       { headers: { 'Authorization': 'Bearer ' + CONFIG.tradierToken, 'Accept': 'application/json' } }
     );
-    if (!expRes.ok) return [];
+    if (!expRes.ok) {
+      const errBody = await expRes.text().catch(function() { return ''; });
+      log('err', symbol + ' expirations HTTP ' + expRes.status + ': ' + errBody.slice(0, 200));
+      return [];
+    }
     const expJson = await expRes.json();
     const expirations = expJson.expirations && expJson.expirations.date;
-    if (!expirations) return [];
+    if (!expirations) {
+      log('warn', symbol + ' no expirations in response: ' + JSON.stringify(expJson).slice(0, 200));
+      return [];
+    }
 
     const today   = new Date(); today.setHours(0, 0, 0, 0);
     const cutoff  = new Date(today.getTime() + 60 * 24 * 60 * 60 * 1000);
@@ -637,7 +644,8 @@ async function runGEXScan(label) {
     }
 
     // AI Recap (now includes market context)
-    // Pushover
+    // Pushover — only if combined succeeded
+    if (!combined) { log('info', 'Skipping Pushover — no GEX data'); return; }
     const spot = combined.spotPrice;
     const supportStr = (combined.topSupport || []).slice(0, 3).map(function(s) {
       return s.strike + ' ($' + Math.round(s.netGEX / 1e6) + 'M)';
