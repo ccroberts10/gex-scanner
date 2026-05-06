@@ -13,6 +13,8 @@ catch(e) { fetch = global.fetch; }
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 const CONFIG = {
   tradierToken:    (process.env.TRADIER_TOKEN      || '').replace(/^["']|["']$/g, '').trim(),
+  alpacaKey:       (process.env.ALPACA_KEY         || process.env.APCA_API_KEY_ID     || '').trim(),
+  alpacaSecret:    (process.env.ALPACA_SECRET      || process.env.APCA_API_SECRET_KEY || '').trim(),
   pushoverUser:    (process.env.PUSHOVER_USER_KEY  || '').replace(/^["']|["']$/g, '').trim(),
   pushoverToken:   (process.env.PUSHOVER_APP_TOKEN || '').replace(/^["']|["']$/g, '').trim(),
   anthropicKey:    (process.env.ANTHROPIC_API_KEY  || '').replace(/^["']|["']$/g, '').trim(),
@@ -55,13 +57,41 @@ let gexRunning = false;
 let gexLastRun = null;
 
 async function fetchSpot(symbol) {
+  // Use Alpaca latest quote — works for SPX (as SPXW or SPX index) and SPY
   try {
-    const res = await fetch('https://api.tradier.com/v1/markets/quotes?symbols=' + symbol,
-      { headers: { 'Authorization': 'Bearer ' + CONFIG.tradierToken, 'Accept': 'application/json' } });
-    if (!res.ok) return null;
-    const json = await res.json();
-    const q = json.quotes && json.quotes.quote;
-    return q && q.last ? parseFloat(q.last) : null;
+    // Alpaca uses SPX for the index; map as needed
+    const alpacaSym = symbol === 'SPX' ? 'SPX' : symbol;
+    const url = 'https://data.alpaca.markets/v2/stocks/' + encodeURIComponent(alpacaSym) + '/trades/latest?feed=iex';
+    const res = await fetch(url, {
+      headers: { 'APCA-API-KEY-ID': CONFIG.alpacaKey, 'APCA-API-SECRET-KEY': CONFIG.alpacaSecret, 'Accept': 'application/json' }
+    });
+    if (res.ok) {
+      const json = await res.json();
+      const price = json && json.trade && json.trade.p ? parseFloat(json.trade.p) : null;
+      if (price) { log('info', 'Alpaca spot ' + symbol + ': ' + price); return price; }
+    }
+    // Fallback: try Alpaca snapshot
+    const url2 = 'https://data.alpaca.markets/v2/stocks/' + encodeURIComponent(alpacaSym) + '/snapshot?feed=iex';
+    const res2 = await fetch(url2, {
+      headers: { 'APCA-API-KEY-ID': CONFIG.alpacaKey, 'APCA-API-SECRET-KEY': CONFIG.alpacaSecret, 'Accept': 'application/json' }
+    });
+    if (res2.ok) {
+      const json2 = await res2.json();
+      const price2 = json2 && json2.latestTrade && json2.latestTrade.p ? parseFloat(json2.latestTrade.p) :
+                     json2 && json2.latestQuote && json2.latestQuote.ap ? parseFloat(json2.latestQuote.ap) : null;
+      if (price2) { log('info', 'Alpaca snapshot ' + symbol + ': ' + price2); return price2; }
+    }
+    // Final fallback: Tradier if token exists
+    if (CONFIG.tradierToken) {
+      const res3 = await fetch('https://api.tradier.com/v1/markets/quotes?symbols=' + symbol,
+        { headers: { 'Authorization': 'Bearer ' + CONFIG.tradierToken, 'Accept': 'application/json' } });
+      if (res3.ok) {
+        const json3 = await res3.json();
+        const q = json3.quotes && json3.quotes.quote;
+        return q && q.last ? parseFloat(q.last) : null;
+      }
+    }
+    return null;
   } catch(e) { log('warn', 'fetchSpot ' + symbol + ': ' + e.message); return null; }
 }
 
@@ -406,7 +436,7 @@ async function generateGEXRecap(data) {
 // ─── MARKET CONTEXT (VIX, P/C, Expected Move, FOMC) ─────────────────────────
 async function fetchMarketContext(spxSpot, spySpot) {
   const ctx = {};
-  if (!CONFIG.tradierToken) return ctx;
+  if (!CONFIG.tradierToken) { log('warn', 'Tradier token not set — skipping market context'); return ctx; }
 
   // ── VIX ──────────────────────────────────────────────────────────────────
   try {
@@ -537,7 +567,7 @@ async function fetchMarketContext(spxSpot, spySpot) {
 
 async function runGEXScan(label) {
   if (gexRunning) { log('warn', 'GEX already running'); return; }
-  if (!CONFIG.tradierToken) { log('warn', 'No TRADIER_TOKEN'); return; }
+  if (!CONFIG.alpacaKey && !CONFIG.tradierToken) { log('warn', 'No API credentials set'); return; }
   gexRunning = true;
   label = label || new Date().toLocaleTimeString('en-US', { timeZone: 'America/Denver', hour12: true });
   log('info', '== GEX scan starting (' + label + ') ==');
@@ -555,18 +585,34 @@ async function runGEXScan(label) {
     if (spyGEX) log('ok', 'SPY GEX: ' + spyGEX.netGEXBillions + 'B | flip: ' + spyGEX.flipPoint);
 
     const combined = combineGEX(spxGEX, spyGEX);
-    if (!combined) { log('err', 'GEX combination failed'); return; }
 
-    // Fetch market context in parallel with GEX combination
+    // Fetch market context regardless of GEX success (FOMC, VIX etc still useful)
     const mktCtx = await fetchMarketContext(spxSpot, spySpot);
-    combined.marketContext = mktCtx;
 
-    combined.ts       = new Date().toLocaleString('en-US', { timeZone: 'America/Denver', hour12: true });
-    combined.runLabel = label;
-    gexData    = combined;
-    gexLastRun = new Date().toISOString();
-
-    log('ok', '== GEX complete — ' + combined.regime + ' | flip: ' + combined.flipPoint + ' | net: ' + combined.netGEXBillions + 'B ==');
+    if (!combined) {
+      log('warn', 'GEX combination failed — options data unavailable (Tradier down?). CTA and market context will still update.');
+      // Save a minimal placeholder so the dashboard shows something
+      if (!gexData) {
+        gexData = {
+          spotPrice: spxSpot || 0, regime: 'UNAVAILABLE', regimeColor: '#4a6070',
+          regimeDesc: 'Options data unavailable — check Tradier token or try again later.',
+          netGEXBillions: 0, flipPoint: null, topSupport: [], topResistance: [],
+          topLevels: [], nearSpotStrikes: [], topControlBands: [], topNegBands: [],
+          strikes: [], marketContext: mktCtx,
+          ts: new Date().toLocaleString('en-US', { timeZone: 'America/Denver', hour12: true }),
+          runLabel: label, error: 'Options chain fetch failed',
+        };
+        gexLastRun = new Date().toISOString();
+      }
+    } else {
+      combined.marketContext = mktCtx;
+      combined.ts       = new Date().toLocaleString('en-US', { timeZone: 'America/Denver', hour12: true });
+      combined.runLabel = label;
+      gexData    = combined;
+      gexLastRun = new Date().toISOString();
+      log('ok', '== GEX complete — ' + combined.regime + ' | flip: ' + combined.flipPoint + ' | net: ' + combined.netGEXBillions + 'B ==');
+      await generateGEXRecap(combined);
+    }
 
     // AI Recap (now includes market context)
     await generateGEXRecap(combined);
@@ -677,21 +723,50 @@ function ctaInterpret(c) {
 }
 
 async function fetchCTABars(symbol, days) {
-  if (!CONFIG.tradierToken) throw new Error('TRADIER_TOKEN not set');
+  // Uses Alpaca for historical daily bars — Tradier /markets/history endpoint
+  // is not available on all token tiers. Alpaca free IEX feed is sufficient.
+  const alpacaKey    = (process.env.ALPACA_KEY    || process.env.APCA_API_KEY_ID     || '').trim();
+  const alpacaSecret = (process.env.ALPACA_SECRET || process.env.APCA_API_SECRET_KEY || '').trim();
+  if (!alpacaKey || !alpacaSecret) throw new Error('ALPACA_KEY / ALPACA_SECRET not set');
+
   const end = new Date();
+  end.setMinutes(end.getMinutes() - 20); // slight backoff to avoid edge-of-data issues
   const start = new Date();
   start.setDate(start.getDate() - Math.ceil(days * 1.6));
-  const fmt = function(d) { return d.toISOString().split('T')[0]; };
-  const url = 'https://api.tradier.com/v1/markets/history?symbol=' + encodeURIComponent(symbol) +
-    '&interval=daily&start=' + fmt(start) + '&end=' + fmt(end);
-  const res = await fetch(url, { headers: { 'Authorization': 'Bearer ' + CONFIG.tradierToken, 'Accept': 'application/json' } });
-  if (!res.ok) throw new Error('Tradier ' + symbol + ' HTTP ' + res.status);
+
+  const url = 'https://data.alpaca.markets/v2/stocks/' + encodeURIComponent(symbol) + '/bars' +
+    '?start=' + encodeURIComponent(start.toISOString()) +
+    '&end='   + encodeURIComponent(end.toISOString()) +
+    '&timeframe=1Day' +
+    '&limit=1000' +
+    '&adjustment=raw' +
+    '&feed=iex';
+
+  const res = await fetch(url, {
+    headers: {
+      'APCA-API-KEY-ID':     alpacaKey,
+      'APCA-API-SECRET-KEY': alpacaSecret,
+      'Accept': 'application/json',
+    },
+  });
+  if (!res.ok) {
+    const errText = await res.text().catch(function() { return ''; });
+    throw new Error('Alpaca ' + symbol + ' HTTP ' + res.status + ': ' + errText.slice(0, 120));
+  }
   const json = await res.json();
-  const day = json && json.history && json.history.day;
-  if (!day) throw new Error('No history for ' + symbol);
-  const arr = Array.isArray(day) ? day : [day];
-  return arr.map(function(b) {
-    return { date: b.date, open: parseFloat(b.open), high: parseFloat(b.high), low: parseFloat(b.low), close: parseFloat(b.close), volume: parseInt(b.volume) || 0 };
+  const bars = json && json.bars;
+  if (!bars || !Array.isArray(bars) || bars.length === 0) throw new Error('No history for ' + symbol);
+
+  // Alpaca bar shape: { t: ISO timestamp, o, h, l, c, v, n, vw }
+  return bars.map(function(b) {
+    return {
+      date:   b.t ? b.t.slice(0, 10) : '',
+      open:   parseFloat(b.o),
+      high:   parseFloat(b.h),
+      low:    parseFloat(b.l),
+      close:  parseFloat(b.c),
+      volume: parseInt(b.v) || 0,
+    };
   }).filter(function(b) { return !isNaN(b.close); });
 }
 
@@ -1494,6 +1569,7 @@ http.createServer(async function(req, res) {
 // ─── START ────────────────────────────────────────────────────────────────────
 log('info', 'GEX Scanner starting...');
 log('info', 'Tradier: ' + (CONFIG.tradierToken ? CONFIG.tradierToken.slice(0,8)+'...' : 'NOT SET'));
+log('info', 'Alpaca:  ' + (CONFIG.alpacaKey ? CONFIG.alpacaKey.slice(0,8)+'...' : 'NOT SET'));
 log('info', 'Pushover: ' + (CONFIG.pushoverUser ? 'OK' : 'NOT SET'));
 startScheduler();
 // Run scan 5s after startup
