@@ -594,6 +594,227 @@ async function fetchMarketContext(spxSpot, spySpot) {
   return ctx;
 }
 
+
+// ─── PREMARKET HIGH/LOW (Alpaca 1-min bars) ──────────────────────────────────
+async function fetchPremarketHighLow(symbol) {
+  try {
+    // 4:00am to 9:29am ET = 08:00 to 13:29 UTC
+    const now = new Date();
+    const todayDate = now.toISOString().slice(0, 10);
+    const pmStart = todayDate + 'T08:00:00Z'; // 4am ET
+    const pmEnd   = todayDate + 'T13:29:00Z'; // 9:29am ET
+
+    const url = 'https://data.alpaca.markets/v2/stocks/' + encodeURIComponent(symbol) +
+      '/bars?start=' + encodeURIComponent(pmStart) +
+      '&end='   + encodeURIComponent(pmEnd) +
+      '&timeframe=1Min&limit=400&feed=iex&adjustment=raw';
+
+    const res = await fetch(url, {
+      headers: { 'APCA-API-KEY-ID': CONFIG.alpacaKey, 'APCA-API-SECRET-KEY': CONFIG.alpacaSecret, 'Accept': 'application/json' }
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    const bars = json && json.bars;
+    if (!bars || !bars.length) return null;
+
+    let pmHigh = -Infinity, pmLow = Infinity;
+    bars.forEach(function(b) {
+      if (b.h > pmHigh) pmHigh = b.h;
+      if (b.l < pmLow)  pmLow  = b.l;
+    });
+    if (pmHigh === -Infinity) return null;
+
+    // SPY to SPX conversion if needed
+    const mult = symbol === 'SPY' ? 10 : 1;
+    return {
+      high: Math.round(pmHigh * mult * 100) / 100,
+      low:  Math.round(pmLow  * mult * 100) / 100,
+      bars: bars.length,
+    };
+  } catch(e) { log('warn', 'fetchPremarketHighLow ' + symbol + ': ' + e.message); return null; }
+}
+
+// ─── FIBONACCI GRID (5-day swing) ────────────────────────────────────────────
+async function fetchFibGrid(spotPrice) {
+  try {
+    // Get 6 days of SPY daily bars to find 5-day swing high/low
+    const end = new Date();
+    end.setMinutes(end.getMinutes() - 20);
+    const start = new Date();
+    start.setDate(start.getDate() - 10);
+
+    const url = 'https://data.alpaca.markets/v2/stocks/SPY/bars' +
+      '?start=' + encodeURIComponent(start.toISOString()) +
+      '&end='   + encodeURIComponent(end.toISOString()) +
+      '&timeframe=1Day&limit=10&feed=iex&adjustment=raw';
+
+    const res = await fetch(url, {
+      headers: { 'APCA-API-KEY-ID': CONFIG.alpacaKey, 'APCA-API-SECRET-KEY': CONFIG.alpacaSecret, 'Accept': 'application/json' }
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    const bars = json && json.bars;
+    if (!bars || bars.length < 3) return null;
+
+    // Use last 5 trading days
+    const recent = bars.slice(-5);
+    let swingHigh = -Infinity, swingLow = Infinity;
+    recent.forEach(function(b) {
+      if (b.h > swingHigh) swingHigh = b.h;
+      if (b.l < swingLow)  swingLow  = b.l;
+    });
+
+    // Convert SPY to SPX (×10)
+    const hi = Math.round(swingHigh * 10 * 100) / 100;
+    const lo = Math.round(swingLow  * 10 * 100) / 100;
+    const range = hi - lo;
+
+    // Fib retracement levels (from high down)
+    const fibs = {
+      swing_high: hi,
+      swing_low:  lo,
+      fib_236: Math.round((hi - range * 0.236) * 100) / 100,
+      fib_382: Math.round((hi - range * 0.382) * 100) / 100,
+      fib_500: Math.round((hi - range * 0.500) * 100) / 100,
+      fib_618: Math.round((hi - range * 0.618) * 100) / 100,
+      fib_786: Math.round((hi - range * 0.786) * 100) / 100,
+      // Extension levels (from low up)
+      ext_1272: Math.round((lo + range * 1.272) * 100) / 100,
+      ext_1618: Math.round((lo + range * 1.618) * 100) / 100,
+    };
+
+    // Determine where spot sits
+    let fibPosition = 'UNKNOWN';
+    if (spotPrice >= hi)               fibPosition = 'ABOVE SWING HIGH — extended';
+    else if (spotPrice >= fibs.fib_236) fibPosition = 'ABOVE 23.6% — strong bull';
+    else if (spotPrice >= fibs.fib_382) fibPosition = 'ABOVE 38.2% — mild pullback';
+    else if (spotPrice >= fibs.fib_500) fibPosition = 'AT 50% — equilibrium';
+    else if (spotPrice >= fibs.fib_618) fibPosition = 'AT 61.8% OTE — buy zone';
+    else if (spotPrice >= fibs.fib_786) fibPosition = 'AT 78.6% — deep retrace';
+    else                                fibPosition = 'BELOW 78.6% — bearish';
+
+    fibs.position = fibPosition;
+    fibs.range = Math.round(range * 10 * 100) / 100; // in SPX points
+    return fibs;
+  } catch(e) { log('warn', 'fetchFibGrid: ' + e.message); return null; }
+}
+
+// ─── CONFLUENCE ZONE DETECTOR ─────────────────────────────────────────────────
+// Finds price levels where GEX + Fib + EM all stack within 15 SPX points
+function detectConfluenceZones(gexData, fibGrid, expectedMoves, spotPrice) {
+  if (!gexData || !spotPrice) return [];
+
+  const zones = [];
+  const TOLERANCE = 15; // points — within this = confluence
+
+  // Build list of significant levels
+  const gexLevels = [];
+  (gexData.topResistance || []).forEach(function(s) {
+    gexLevels.push({ price: s.strike, type: 'GEX_RESIST', gexM: Math.round(s.netGEX / 1e6), label: 'GEX Resistance $' + Math.round(s.netGEX / 1e6) + 'M' });
+  });
+  (gexData.topSupport || []).forEach(function(s) {
+    gexLevels.push({ price: s.strike, type: 'GEX_SUPPORT', gexM: Math.round(s.netGEX / 1e6), label: 'GEX Support $' + Math.round(s.netGEX / 1e6) + 'M' });
+  });
+  if (gexData.flipPoint) gexLevels.push({ price: gexData.flipPoint, type: 'GEX_FLIP', label: 'GEX Flip Point' });
+
+  const fibLevels = fibGrid ? [
+    { price: fibGrid.fib_236, label: 'Fib 23.6%' },
+    { price: fibGrid.fib_382, label: 'Fib 38.2%' },
+    { price: fibGrid.fib_500, label: 'Fib 50% (Equilibrium)' },
+    { price: fibGrid.fib_618, label: 'Fib 61.8% OTE' },
+    { price: fibGrid.fib_786, label: 'Fib 78.6%' },
+    { price: fibGrid.ext_1272, label: 'Fib Ext 127.2%' },
+    { price: fibGrid.ext_1618, label: 'Fib Ext 161.8%' },
+    { price: fibGrid.swing_high, label: '5D Swing High' },
+    { price: fibGrid.swing_low,  label: '5D Swing Low' },
+  ] : [];
+
+  const emLevels = [];
+  (expectedMoves || []).slice(0, 2).forEach(function(em) {
+    emLevels.push({ price: em.hiTarget, label: '1σ EM High (' + em.expiry + ')' });
+    emLevels.push({ price: em.loTarget, label: '1σ EM Low ('  + em.expiry + ')' });
+    // 1.5σ and 2σ
+    const emPts = em.emPoints;
+    emLevels.push({ price: Math.round(spotPrice + emPts * 1.5), label: '1.5σ EM High (' + em.expiry + ')' });
+    emLevels.push({ price: Math.round(spotPrice - emPts * 1.5), label: '1.5σ EM Low ('  + em.expiry + ')' });
+    emLevels.push({ price: Math.round(spotPrice + emPts * 2),   label: '2σ EM High ('   + em.expiry + ')' });
+    emLevels.push({ price: Math.round(spotPrice - emPts * 2),   label: '2σ EM Low ('    + em.expiry + ')' });
+  });
+
+  // For each GEX level, check if any fib or EM level is within tolerance
+  gexLevels.forEach(function(gex) {
+    const confluences = [];
+    const allOther = fibLevels.concat(emLevels);
+    allOther.forEach(function(other) {
+      if (Math.abs(other.price - gex.price) <= TOLERANCE) {
+        confluences.push(other.label + ' (' + other.price + ')');
+      }
+    });
+
+    if (confluences.length >= 1) {
+      const aboveSpot = gex.price > spotPrice;
+      const isGEXResist = gex.type === 'GEX_RESIST';
+      const isGEXSupport = gex.type === 'GEX_SUPPORT';
+      const strength = confluences.length >= 2 ? 'TRIPLE CONFLUENCE' : 'DOUBLE CONFLUENCE';
+      const strengthColor = confluences.length >= 2 ? '#ff6b35' : '#ffd166';
+
+      // Determine trade setup
+      let setup = '', setupColor = '#d8eaf5', buyOrSell = '';
+      if (aboveSpot && isGEXResist) {
+        setup = 'FADE / SHORT SETUP — sell into resistance';
+        setupColor = '#ff2d55';
+        buyOrSell = 'SELL';
+      } else if (!aboveSpot && isGEXSupport) {
+        setup = 'BUY THE DIP — long at support';
+        setupColor = '#39ff14';
+        buyOrSell = 'BUY';
+      } else if (gex.type === 'GEX_FLIP') {
+        setup = aboveSpot ? 'RECLAIM TARGET — regime change if breached' : 'FLIP ZONE — dealers change behavior here';
+        setupColor = '#ffd166';
+        buyOrSell = aboveSpot ? 'WATCH' : 'WATCH';
+      }
+
+      // Trade structure based on GEX regime
+      const regime = gexData.regime || '';
+      let structure = '';
+      if (buyOrSell === 'SELL') {
+        structure = regime === 'TRENDING' ?
+          'Bear put spread (debit) — trending regime, buy premium' :
+          'Sell call spread (credit) or buy puts — pinning regime';
+      } else if (buyOrSell === 'BUY') {
+        structure = regime === 'TRENDING' ?
+          'Bull call spread (debit) — trending regime, buy premium' :
+          'Sell put spread (credit) or buy calls — pinning regime';
+      }
+
+      zones.push({
+        price: gex.price,
+        aboveSpot,
+        buyOrSell,
+        strength,
+        strengthColor,
+        confluenceCount: confluences.length + 1, // +1 for GEX itself
+        gexLabel: gex.label,
+        confluences,
+        setup,
+        setupColor,
+        structure,
+        ptsFromSpot: Math.round(gex.price - spotPrice),
+      });
+    }
+  });
+
+  // Sort: above spot ascending, below spot descending
+  zones.sort(function(a, b) {
+    if (a.aboveSpot && !b.aboveSpot) return -1;
+    if (!a.aboveSpot && b.aboveSpot) return 1;
+    if (a.aboveSpot) return a.price - b.price;
+    return b.price - a.price;
+  });
+
+  return zones;
+}
+
 async function runGEXScan(label) {
   if (gexRunning) { log('warn', 'GEX already running'); return; }
   if (!CONFIG.alpacaKey && !CONFIG.tradierToken) { log('warn', 'No API credentials set'); return; }
@@ -618,6 +839,13 @@ async function runGEXScan(label) {
     // Fetch market context regardless of GEX success (FOMC, VIX etc still useful)
     const mktCtx = await fetchMarketContext(spxSpot, spySpot);
 
+    // Fetch fib grid and premarket levels (Alpaca-based, always available)
+    const fibGrid = await fetchFibGrid(spxSpot || (spySpot * 10));
+    if (fibGrid) log('info', 'Fib grid: swing ' + fibGrid.swing_low + '-' + fibGrid.swing_high + ' | ' + fibGrid.position);
+
+    const pmLevels = spySpot ? await fetchPremarketHighLow('SPY') : null;
+    if (pmLevels) log('info', 'PM levels: high=' + pmLevels.high + ' low=' + pmLevels.low);
+
     if (!combined) {
       log('warn', 'GEX combination failed — options data unavailable (Tradier down?). CTA and market context will still update.');
       // Save a minimal placeholder so the dashboard shows something
@@ -627,7 +855,8 @@ async function runGEXScan(label) {
           regimeDesc: 'Options data unavailable — check Tradier token or try again later.',
           netGEXBillions: 0, flipPoint: null, topSupport: [], topResistance: [],
           topLevels: [], nearSpotStrikes: [], topControlBands: [], topNegBands: [],
-          strikes: [], marketContext: mktCtx,
+          strikes: [], marketContext: mktCtx, fibGrid: fibGrid, pmLevels: pmLevels,
+          confluenceZones: [],
           ts: new Date().toLocaleString('en-US', { timeZone: 'America/Denver', hour12: true }),
           runLabel: label, error: 'Options chain fetch failed',
         };
@@ -635,6 +864,17 @@ async function runGEXScan(label) {
       }
     } else {
       combined.marketContext = mktCtx;
+      combined.fibGrid   = fibGrid;
+      combined.pmLevels  = pmLevels;
+      // Detect confluence zones now that we have GEX + fib + EM
+      combined.confluenceZones = detectConfluenceZones(
+        combined, fibGrid,
+        mktCtx && mktCtx.expectedMoves ? mktCtx.expectedMoves : [],
+        combined.spotPrice
+      );
+      if (combined.confluenceZones && combined.confluenceZones.length) {
+        log('ok', 'Confluence zones found: ' + combined.confluenceZones.length);
+      }
       combined.ts       = new Date().toLocaleString('en-US', { timeZone: 'America/Denver', hour12: true });
       combined.runLabel = label;
       gexData    = combined;
@@ -1203,6 +1443,115 @@ ${d.aiRecap ? `
       return sentences.map(function(s) { return esc(s); }).join(' ') +
         (last ? ' <div style="margin-top:14px;padding:12px 16px;background:#111820;border-left:3px solid #00d4ff;border-radius:0 6px 6px 0;font-size:13px;font-weight:600;color:#00d4ff">' + esc(last) + '</div>' : '');
     })()}</div>
+  </div>
+</div>
+` : ''}
+
+${(d.fibGrid || d.pmLevels) ? `
+<!-- FIB GRID + PREMARKET -->
+<div class="card" style="margin-bottom:16px">
+  <div class="card-head">
+    <span class="card-title">&#128200; 5-Day Fib Grid &amp; Pre-Market Levels</span>
+    <span style="font-size:11px;color:#4a6070">5-day swing retracements + SPY pre-market high/low</span>
+  </div>
+  <div style="padding:16px 20px">
+
+    ${d.fibGrid ? `
+    <!-- Fib position badge -->
+    <div style="margin-bottom:16px;padding:10px 16px;background:#111820;border-radius:8px;display:flex;align-items:center;gap:16px;flex-wrap:wrap">
+      <div>
+        <div style="font-size:10px;color:#4a6070;letter-spacing:1px;margin-bottom:3px">PRICE POSITION</div>
+        <div style="font-size:13px;font-weight:700;color:#ffd166">${d.fibGrid.position}</div>
+      </div>
+      <div>
+        <div style="font-size:10px;color:#4a6070;letter-spacing:1px;margin-bottom:3px">5D RANGE</div>
+        <div class="mono" style="font-size:13px;color:#d8eaf5">${d.fibGrid.swing_low} — ${d.fibGrid.swing_high} <span style="color:#4a6070">(${d.fibGrid.range}pts)</span></div>
+      </div>
+      ${d.pmLevels ? `
+      <div>
+        <div style="font-size:10px;color:#4a6070;letter-spacing:1px;margin-bottom:3px">PM HIGH / LOW</div>
+        <div class="mono" style="font-size:13px"><span style="color:#39ff14">${d.pmLevels.high}</span> <span style="color:#4a6070">/</span> <span style="color:#ff2d55">${d.pmLevels.low}</span></div>
+      </div>` : ''}
+    </div>
+
+    <!-- Fib level bars -->
+    <div style="position:relative">
+      ${(function() {
+        const f = d.fibGrid;
+        const spot = d.spotPrice;
+        const levels = [
+          { price: f.ext_1618, label: 'Ext 161.8%', color: '#ff6b35', bold: false },
+          { price: f.ext_1272, label: 'Ext 127.2%', color: '#ff6b35', bold: false },
+          { price: f.swing_high, label: '5D High (BSL)', color: '#39ff14', bold: true },
+          { price: f.fib_236, label: '23.6%', color: '#39ff14', bold: false },
+          { price: f.fib_382, label: '38.2%', color: '#ffd166', bold: false },
+          { price: f.fib_500, label: '50% Equilibrium', color: '#ffd166', bold: true },
+          { price: f.fib_618, label: '61.8% OTE', color: '#ff6b35', bold: true },
+          { price: f.fib_786, label: '78.6%', color: '#ff2d55', bold: false },
+          { price: f.swing_low, label: '5D Low (SSL)', color: '#ff2d55', bold: true },
+        ].filter(function(l) { return l.price && Math.abs(l.price - spot) / spot < 0.06; });
+
+        // Add PM levels
+        if (d.pmLevels) {
+          if (Math.abs(d.pmLevels.high - spot) / spot < 0.06) levels.push({ price: d.pmLevels.high, label: 'PM High', color: '#00d4ff', bold: true });
+          if (Math.abs(d.pmLevels.low  - spot) / spot < 0.06) levels.push({ price: d.pmLevels.low,  label: 'PM Low',  color: '#00d4ff', bold: true });
+        }
+
+        levels.sort(function(a, b) { return b.price - a.price; });
+
+        return levels.map(function(l) {
+          const isSpot = Math.abs(l.price - spot) <= 8;
+          const aboveSpot = l.price > spot;
+          const pctAway = ((l.price - spot) / spot * 100).toFixed(1);
+          return '<div style="display:flex;align-items:center;gap:12px;margin-bottom:8px;padding:7px 10px;background:' +
+            (isSpot ? 'rgba(0,212,255,0.08)' : 'transparent') +
+            ';border-radius:6px;border-left:3px solid ' + l.color + '">' +
+            '<div class="mono" style="width:60px;font-size:13px;font-weight:' + (l.bold ? '700' : '400') + ';color:' + l.color + '">' + l.price + '</div>' +
+            '<div style="flex:1;font-size:11px;color:#8aa0b0">' + l.label + '</div>' +
+            '<div class="mono" style="font-size:11px;color:#4a6070">' + (pctAway >= 0 ? '+' : '') + pctAway + '%</div>' +
+            (isSpot ? '<div style="font-size:9px;font-weight:700;color:#00d4ff;letter-spacing:1px">◀ SPOT</div>' : '') +
+          '</div>';
+        }).join('');
+      })()}
+    </div>
+    ` : ''}
+  </div>
+</div>
+` : ''}
+
+${(d.confluenceZones && d.confluenceZones.length) ? `
+<!-- CONFLUENCE ZONES + TRADE SETUPS -->
+<div class="card" style="margin-bottom:16px">
+  <div class="card-head">
+    <span class="card-title">&#9889; Confluence Zones — Trade Setups</span>
+    <span style="font-size:11px;color:#4a6070">GEX + Fib + Expected Move stacking within 15pts</span>
+  </div>
+  <div style="padding:16px 20px">
+    <div style="font-size:11px;color:#4a6070;margin-bottom:14px;line-height:1.7">
+      A confluence zone is where a GEX level aligns with a Fibonacci retracement AND/OR an expected move boundary within 15 SPX points.
+      More confluences = higher conviction. Always trade WITH the GEX regime.
+    </div>
+    ${(d.confluenceZones || []).map(function(z) {
+      const distStr = (z.ptsFromSpot > 0 ? '+' : '') + z.ptsFromSpot + ' pts from spot';
+      return '<div style="margin-bottom:14px;padding:14px 16px;background:#111820;border-radius:8px;border-left:4px solid ' + z.strengthColor + '">' +
+        '<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:10px">' +
+          '<div style="display:flex;align-items:center;gap:12px">' +
+            '<div class="mono" style="font-size:24px;font-weight:700;color:' + z.setupColor + '">' + z.price + '</div>' +
+            '<div>' +
+              '<div style="font-size:10px;font-weight:700;color:' + z.strengthColor + ';letter-spacing:1px">' + z.strength + ' (' + z.confluenceCount + ' signals)</div>' +
+              '<div style="font-size:10px;color:#4a6070">' + distStr + '</div>' +
+            '</div>' +
+          '</div>' +
+          '<div style="padding:5px 12px;border-radius:4px;font-size:11px;font-weight:700;letter-spacing:1px;background:' +
+            (z.buyOrSell === 'BUY' ? 'rgba(57,255,20,0.15);color:#39ff14' :
+             z.buyOrSell === 'SELL' ? 'rgba(255,45,85,0.15);color:#ff2d55' :
+             'rgba(255,209,102,0.15);color:#ffd166') + '">' + (z.buyOrSell || 'WATCH') + '</div>' +
+        '</div>' +
+        '<div style="font-size:12px;font-weight:600;color:' + z.setupColor + ';margin-bottom:8px">' + z.setup + '</div>' +
+        '<div style="font-size:11px;color:#4a6070;margin-bottom:6px">Confluences: ' + [z.gexLabel].concat(z.confluences).join(' · ') + '</div>' +
+        (z.structure ? '<div style="font-size:11px;color:#00d4ff;padding:6px 10px;background:rgba(0,212,255,0.06);border-radius:4px">&#9654; ' + z.structure + '</div>' : '') +
+      '</div>';
+    }).join('')}
   </div>
 </div>
 ` : ''}
