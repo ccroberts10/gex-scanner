@@ -1261,6 +1261,138 @@ function renderCTASection() {
 </div>`;
 }
 
+
+// ─── TICKER GEX SCANNER ──────────────────────────────────────────────────────
+let tickerCache = {}; // { SYMBOL: { data, ts } }
+
+async function scanTickerGEX(symbol) {
+  symbol = symbol.toUpperCase().trim();
+  if (!symbol || symbol.length > 6) throw new Error('Invalid symbol');
+
+  // Check cache — reuse if less than 15 min old
+  const cached = tickerCache[symbol];
+  if (cached && (Date.now() - cached.ts) < 15 * 60 * 1000) {
+    log('info', 'Ticker cache hit: ' + symbol);
+    return cached.data;
+  }
+
+  log('info', '== Ticker GEX scan: ' + symbol + ' ==');
+
+  // 1. Get spot price
+  const spotRes = await fetch('https://api.tradier.com/v1/markets/quotes?symbols=' + symbol,
+    { headers: { 'Authorization': 'Bearer ' + CONFIG.tradierToken, 'Accept': 'application/json' } });
+  if (!spotRes.ok) throw new Error('Quote fetch failed: HTTP ' + spotRes.status);
+  const spotJson = await spotRes.json();
+  const q = spotJson.quotes && spotJson.quotes.quote;
+  const spotPrice = q && q.last ? parseFloat(q.last) : null;
+  if (!spotPrice) throw new Error('No price data for ' + symbol);
+
+  // 2. Get expirations
+  const expRes = await fetch(
+    'https://api.tradier.com/v1/markets/options/expirations?symbol=' + symbol + '&includeAllRoots=true',
+    { headers: { 'Authorization': 'Bearer ' + CONFIG.tradierToken, 'Accept': 'application/json' } }
+  );
+  if (!expRes.ok) throw new Error('Expirations failed: HTTP ' + expRes.status);
+  const expJson = await expRes.json();
+  const expirations = expJson.expirations && expJson.expirations.date;
+  if (!expirations) throw new Error('No options data for ' + symbol + ' — may not be optionable');
+
+  const today  = new Date(); today.setHours(0,0,0,0);
+  const cutoff = new Date(today.getTime() + 60 * 24 * 60 * 60 * 1000);
+  const expList = (Array.isArray(expirations) ? expirations : [expirations])
+    .filter(function(e) { const d = new Date(e + 'T00:00:00'); return d >= today && d <= cutoff; })
+    .slice(0, 4); // fewer expirations for speed
+
+  log('info', symbol + ' scanning ' + expList.length + ' expirations at $' + spotPrice);
+
+  // 3. Fetch chains
+  const contracts = [];
+  for (const exp of expList) {
+    try {
+      const chainRes = await fetch(
+        'https://api.tradier.com/v1/markets/options/chains?symbol=' + symbol + '&expiration=' + exp + '&greeks=true',
+        { headers: { 'Authorization': 'Bearer ' + CONFIG.tradierToken, 'Accept': 'application/json' } }
+      );
+      if (!chainRes.ok) continue;
+      const chainJson = await chainRes.json();
+      const opts = chainJson.options && chainJson.options.option;
+      if (opts && opts.length) contracts.push(...opts);
+      await new Promise(function(r) { setTimeout(r, 300); });
+    } catch(e) { log('warn', symbol + ' chain ' + exp + ': ' + e.message); }
+  }
+  if (!contracts.length) throw new Error('No contracts fetched for ' + symbol);
+
+  // 4. Calculate GEX
+  const gex = calculateGEX(contracts, spotPrice);
+  if (!gex) throw new Error('GEX calculation failed for ' + symbol);
+
+  // 5. Call selling score (0-100)
+  // High score = good environment for selling calls
+  // Based on: positive GEX (+), low negative GEX magnitude, resistance above spot
+  let callScore = 50;
+  if (gex.netGEXBillions > 2)       callScore = 95; // STRONG PIN — ideal
+  else if (gex.netGEXBillions > 0)   callScore = 75; // MILD PIN — good
+  else if (gex.netGEXBillions > -1)  callScore = 45; // MILD TREND — marginal
+  else if (gex.netGEXBillions > -3)  callScore = 25; // TRENDING — avoid
+  else                                callScore = 10; // STRONG TREND — do not sell calls
+
+  // Bonus: if nearest resistance is close overhead (natural cap)
+  const nearestResist = gex.topResistance && gex.topResistance[0];
+  if (nearestResist) {
+    const pctAway = (nearestResist.strike - spotPrice) / spotPrice * 100;
+    if (pctAway < 1.5) callScore = Math.min(callScore + 10, 100); // tight cap overhead
+    if (pctAway > 5)   callScore = Math.max(callScore - 10, 0);   // resistance far away
+  }
+
+  // 6. Build recommended strikes (top resistance levels = best call strikes to sell)
+  const callStrikes = (gex.topResistance || []).slice(0, 3).map(function(s) {
+    const pctAway = ((s.strike - spotPrice) / spotPrice * 100).toFixed(1);
+    const gexM = Math.round(s.netGEX / 1e6);
+    return {
+      strike: s.strike,
+      pctAway: parseFloat(pctAway),
+      gexM,
+      recommendation: pctAway < 1 ? 'AT THE WALL — aggressive' :
+                      pctAway < 2 ? 'NEAR THE WALL — preferred' :
+                      pctAway < 4 ? 'SAFE DISTANCE — conservative' : 'FAR OTM — low premium',
+    };
+  });
+
+  // 7. Score label
+  const scoreLabel = callScore >= 80 ? 'EXCELLENT — ideal for selling calls' :
+                     callScore >= 60 ? 'GOOD — favorable for premium selling' :
+                     callScore >= 40 ? 'MARGINAL — proceed with caution' :
+                     callScore >= 20 ? 'POOR — trending regime, avoid selling calls' :
+                                       'DO NOT SELL — dealers amplifying moves';
+  const scoreColor = callScore >= 80 ? '#39ff14' :
+                     callScore >= 60 ? '#ffd166' :
+                     callScore >= 40 ? '#ff6b35' : '#ff2d55';
+
+  const result = {
+    symbol,
+    spotPrice,
+    ts: new Date().toLocaleString('en-US', { timeZone: 'America/Denver', hour12: true }),
+    regime: gex.regime,
+    regimeColor: gex.regimeColor,
+    regimeDesc: gex.regimeDesc,
+    netGEXBillions: gex.netGEXBillions,
+    flipPoint: gex.flipPoint,
+    callScore,
+    scoreLabel,
+    scoreColor,
+    callStrikes,
+    topResistance: gex.topResistance,
+    topSupport: gex.topSupport,
+    topLevels: gex.topLevels,
+    contractsUsed: gex.contractsUsed,
+  };
+
+  // Cache it
+  tickerCache[symbol] = { data: result, ts: Date.now() };
+  log('ok', symbol + ' GEX done — score: ' + callScore + ' | regime: ' + gex.regime + ' | flip: ' + gex.flipPoint);
+  return result;
+}
+
 // ─── SCHEDULER ────────────────────────────────────────────────────────────────
 function startScheduler() {
   // 8:00am MST = 15:00 UTC (MDT)
@@ -1716,6 +1848,26 @@ ${(d.nearSpotStrikes && d.nearSpotStrikes.length) ? `
 
 ${renderCTASection()}
 
+<!-- TICKER GEX SCANNER -->
+<div class="card" style="margin-bottom:16px">
+  <div class="card-head">
+    <span class="card-title">&#128269; Ticker GEX Scanner — Call Selling Analyzer</span>
+    <span style="font-size:11px;color:#4a6070">Scan any optionable stock for GEX regime + best call strikes to sell</span>
+  </div>
+  <div style="padding:16px 20px;display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
+    <div>
+      <div style="font-size:10px;color:#4a6070;letter-spacing:1px;margin-bottom:6px">TICKER SYMBOL</div>
+      <input type="text" id="ticker-input" placeholder="AAPL, TSLA, NVDA..." maxlength="6"
+        style="background:#111820;border:1px solid #1a2535;color:#d8eaf5;padding:9px 13px;font-family:'Space Mono',monospace;font-size:16px;font-weight:700;width:180px;border-radius:6px;outline:none;text-transform:uppercase"
+        onkeydown="if(event.key==='Enter')scanTicker()"
+        oninput="this.value=this.value.toUpperCase()">
+    </div>
+    <button class="btn bp" onclick="scanTicker()" style="margin-bottom:1px">&#9654; Scan GEX</button>
+    <span id="ticker-msg" style="font-size:12px;color:#4a6070"></span>
+  </div>
+  <div id="ticker-result"></div>
+</div>
+
 <!-- LOG -->
 <div class="card">
   <div class="card-head"><span class="card-title">Activity Log</span></div>
@@ -1819,6 +1971,104 @@ function testPush(btn) {
     setTimeout(function() { btn.disabled = false; btn.textContent = '&#128276; Test Alert'; }, 3000);
   }).catch(function() { btn.disabled = false; btn.textContent = '&#128276; Test Alert'; });
 }
+function scanTicker(btn) {
+  var sym = document.getElementById('ticker-input').value.trim().toUpperCase();
+  var msg = document.getElementById('ticker-msg');
+  var res = document.getElementById('ticker-result');
+  if (!sym || sym.length > 6) { msg.textContent = 'Enter a valid ticker'; msg.style.color='#ff2d55'; return; }
+  msg.textContent = 'Scanning ' + sym + '...'; msg.style.color = '#00d4ff';
+  res.innerHTML = '';
+  fetch('/api/ticker/' + sym, { method: 'POST' })
+  .then(function(r) { return r.json(); })
+  .then(function(d) {
+    if (d.error) { msg.textContent = 'Error: ' + d.error; msg.style.color='#ff2d55'; return; }
+    msg.textContent = 'Done — ' + d.ts; msg.style.color = '#39ff14';
+
+    // Score gauge
+    var scoreFill = Math.min(d.callScore, 100);
+    var scoreCol  = d.scoreColor || '#ffd166';
+
+    // Strike rows
+    var strikeRows = (d.callStrikes || []).map(function(s) {
+      var recCol = s.pctAway < 2 ? '#ffd166' : '#8aa0b0';
+      return '<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid #0d1f2d">' +
+        '<div>' +
+          '<div class="mono" style="font-size:18px;font-weight:700;color:#39ff14">$' + s.strike + '</div>' +
+          '<div style="font-size:10px;color:#4a6070">+' + s.pctAway + '% from spot · GEX: +$' + s.gexM + 'M</div>' +
+        '</div>' +
+        '<div style="font-size:10px;color:' + recCol + ';text-align:right;letter-spacing:1px">' + s.recommendation + '</div>' +
+      '</div>';
+    }).join('');
+
+    // Support rows (put side — for reference)
+    var supportRows = (d.topSupport || []).slice(0,3).map(function(s) {
+      var pct = ((s.strike - d.spotPrice) / d.spotPrice * 100).toFixed(1);
+      return '<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid #0d1f2d">' +
+        '<div class="mono" style="font-size:15px;font-weight:700;color:#ff2d55">$' + s.strike + '</div>' +
+        '<div style="font-size:10px;color:#4a6070">' + pct + '% · $' + Math.abs(Math.round(s.netGEX/1e6)) + 'M GEX</div>' +
+      '</div>';
+    }).join('');
+
+    res.innerHTML =
+      '<div style="padding:16px 20px;border-top:1px solid #1a2535">' +
+
+        // Header row
+        '<div style="display:flex;align-items:center;gap:20px;flex-wrap:wrap;margin-bottom:20px">' +
+          '<div>' +
+            '<div style="font-size:11px;color:#4a6070;letter-spacing:2px;margin-bottom:3px">SYMBOL</div>' +
+            '<div class="mono" style="font-size:32px;font-weight:700;color:#00d4ff">' + d.symbol + '</div>' +
+            '<div style="font-size:12px;color:#4a6070">$' + d.spotPrice + '</div>' +
+          '</div>' +
+          '<div>' +
+            '<div style="font-size:11px;color:#4a6070;letter-spacing:2px;margin-bottom:3px">REGIME</div>' +
+            '<div class="mono" style="font-size:18px;font-weight:700;color:' + d.regimeColor + '">' + d.regime + '</div>' +
+            '<div style="font-size:11px;color:#8aa0b0">' + (d.netGEXBillions >= 0 ? '+' : '') + d.netGEXBillions + 'B net GEX</div>' +
+          '</div>' +
+          '<div>' +
+            '<div style="font-size:11px;color:#4a6070;letter-spacing:2px;margin-bottom:3px">GEX FLIP</div>' +
+            '<div class="mono" style="font-size:18px;font-weight:700;color:#ffd166">' + (d.flipPoint || 'N/A') + '</div>' +
+            '<div style="font-size:11px;color:#4a6070">regime change level</div>' +
+          '</div>' +
+        '</div>' +
+
+        // Call selling score
+        '<div style="margin-bottom:20px;padding:14px 16px;background:#111820;border-radius:8px;border-left:4px solid ' + scoreCol + '">' +
+          '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">' +
+            '<div style="font-size:10px;color:#4a6070;letter-spacing:2px">CALL SELLING SCORE</div>' +
+            '<div class="mono" style="font-size:28px;font-weight:700;color:' + scoreCol + '">' + d.callScore + '/100</div>' +
+          '</div>' +
+          '<div style="height:10px;background:#070a0f;border-radius:5px;overflow:hidden;margin-bottom:8px">' +
+            '<div style="height:100%;width:' + scoreFill + '%;background:' + scoreCol + ';border-radius:5px;transition:width .5s"></div>' +
+          '</div>' +
+          '<div style="font-size:12px;font-weight:600;color:' + scoreCol + '">' + d.scoreLabel + '</div>' +
+          '<div style="font-size:11px;color:#8aa0b0;margin-top:4px">' + d.regimeDesc + '</div>' +
+        '</div>' +
+
+        // Two column: call strikes + support
+        '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">' +
+          '<div>' +
+            '<div style="font-size:10px;color:#39ff14;letter-spacing:2px;margin-bottom:10px">&#9650; BEST CALL STRIKES TO SELL</div>' +
+            (strikeRows || '<div style="color:#4a6070;font-size:12px">No resistance levels found</div>') +
+          '</div>' +
+          '<div>' +
+            '<div style="font-size:10px;color:#ff2d55;letter-spacing:2px;margin-bottom:10px">&#9660; KEY SUPPORT (PUT SIDE)</div>' +
+            (supportRows || '<div style="color:#4a6070;font-size:12px">No support levels found</div>') +
+          '</div>' +
+        '</div>' +
+
+        // Trade rules reminder
+        '<div style="margin-top:16px;padding:10px 14px;background:rgba(0,212,255,0.05);border-left:3px solid rgba(0,212,255,0.3);border-radius:0 6px 6px 0;font-size:11px;color:#4a6070;line-height:1.8">' +
+          '&#9654; Sell calls AT or just above nearest GEX resistance &nbsp;·&nbsp; ' +
+          'Stop = close above GEX flip point &nbsp;·&nbsp; ' +
+          'Best in STRONG PIN / MILD PIN regime &nbsp;·&nbsp; ' +
+          'Avoid selling calls in TRENDING regime' +
+        '</div>' +
+
+      '</div>';
+  })
+  .catch(function(e) { msg.textContent = 'Failed: ' + e.message; msg.style.color='#ff2d55'; });
+}
+
 function refreshCTA(btn) {
   if (btn) { btn.disabled = true; btn.textContent = 'Refreshing...'; }
   fetch('/api/cta/refresh', { method: 'POST' }).then(function() {
@@ -1850,6 +2100,18 @@ http.createServer(async function(req, res) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true, running: ctaRunning }));
     if (!ctaRunning) refreshCTA();
+    return;
+  }
+
+  if (req.method === 'POST' && url.startsWith('/api/ticker/')) {
+    const symbol = url.replace('/api/ticker/', '').toUpperCase().trim();
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    try {
+      const result = await scanTickerGEX(symbol);
+      res.end(JSON.stringify(result));
+    } catch(e) {
+      res.end(JSON.stringify({ error: e.message }));
+    }
     return;
   }
 
