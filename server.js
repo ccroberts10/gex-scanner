@@ -1358,7 +1358,38 @@ async function scanTickerGEX(symbol) {
     };
   });
 
-  // 7. Score label
+  // 6b. Buy premium score (inverse of call selling — trending = buy premium)
+  let buyScore = 100 - callScore; // base inverse
+  // Fine-tune: TRENDING with strong momentum = best buy environment
+  if (gex.netGEXBillions < -3)      buyScore = 95;
+  else if (gex.netGEXBillions < -1) buyScore = 75;
+  else if (gex.netGEXBillions < 0)  buyScore = 55;
+  else if (gex.netGEXBillions < 2)  buyScore = 30;
+  else                               buyScore = 10; // STRONG PIN = bad for buying premium
+
+  const buyScoreLabel = buyScore >= 80 ? 'EXCELLENT — buy calls/puts with momentum' :
+                        buyScore >= 60 ? 'GOOD — debit spreads favored' :
+                        buyScore >= 40 ? 'MARGINAL — small size only' :
+                        buyScore >= 20 ? 'POOR — pinning regime, premium decays fast' :
+                                         'DO NOT BUY — dealers pinning, theta crush';
+  const buyScoreColor = buyScore >= 80 ? '#39ff14' :
+                        buyScore >= 60 ? '#ffd166' :
+                        buyScore >= 40 ? '#ff6b35' : '#ff2d55';
+
+  // Best levels to buy calls at (support levels = dip-buy entries in trending regime)
+  const callBuyLevels = (gex.topSupport || []).slice(0, 3).map(function(s) {
+    const pctAway = ((s.strike - spotPrice) / spotPrice * 100).toFixed(1);
+    return {
+      strike: s.strike,
+      pctAway: parseFloat(pctAway),
+      gexM: Math.abs(Math.round(s.netGEX / 1e6)),
+      recommendation: Math.abs(parseFloat(pctAway)) < 1 ? 'AT SUPPORT — aggressive entry' :
+                      Math.abs(parseFloat(pctAway)) < 3 ? 'NEAR SUPPORT — preferred entry' :
+                                                           'DEEP SUPPORT — conservative entry',
+    };
+  });
+
+  // 7. Score labels
   const scoreLabel = callScore >= 80 ? 'EXCELLENT — ideal for selling calls' :
                      callScore >= 60 ? 'GOOD — favorable for premium selling' :
                      callScore >= 40 ? 'MARGINAL — proceed with caution' :
@@ -1380,7 +1411,11 @@ async function scanTickerGEX(symbol) {
     callScore,
     scoreLabel,
     scoreColor,
+    buyScore,
+    buyScoreLabel,
+    buyScoreColor,
     callStrikes,
+    callBuyLevels,
     topResistance: gex.topResistance,
     topSupport: gex.topSupport,
     topLevels: gex.topLevels,
@@ -2031,37 +2066,96 @@ function scanTicker(btn) {
           '</div>' +
         '</div>' +
 
-        // Call selling score
-        '<div style="margin-bottom:20px;padding:14px 16px;background:#111820;border-radius:8px;border-left:4px solid ' + scoreCol + '">' +
-          '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">' +
-            '<div style="font-size:10px;color:#4a6070;letter-spacing:2px">CALL SELLING SCORE</div>' +
-            '<div class="mono" style="font-size:28px;font-weight:700;color:' + scoreCol + '">' + d.callScore + '/100</div>' +
+        // Dual score cards
+        '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:20px">' +
+
+          // SELL calls score
+          '<div style="padding:14px 16px;background:#111820;border-radius:8px;border-left:4px solid ' + scoreCol + '">' +
+            '<div style="font-size:10px;color:#4a6070;letter-spacing:1px;margin-bottom:6px">SELL CALLS SCORE</div>' +
+            '<div class="mono" style="font-size:32px;font-weight:700;color:' + scoreCol + '">' + d.callScore + '<span style="font-size:14px;color:#4a6070">/100</span></div>' +
+            '<div style="height:6px;background:#070a0f;border-radius:3px;overflow:hidden;margin:8px 0">' +
+              '<div style="height:100%;width:' + scoreFill + '%;background:' + scoreCol + ';border-radius:3px"></div>' +
+            '</div>' +
+            '<div style="font-size:10px;font-weight:600;color:' + scoreCol + ';line-height:1.5">' + d.scoreLabel + '</div>' +
           '</div>' +
-          '<div style="height:10px;background:#070a0f;border-radius:5px;overflow:hidden;margin-bottom:8px">' +
-            '<div style="height:100%;width:' + scoreFill + '%;background:' + scoreCol + ';border-radius:5px;transition:width .5s"></div>' +
+
+          // BUY calls score
+          '<div style="padding:14px 16px;background:#111820;border-radius:8px;border-left:4px solid ' + (d.buyScoreColor || '#ffd166') + '">' +
+            '<div style="font-size:10px;color:#4a6070;letter-spacing:1px;margin-bottom:6px">BUY PREMIUM SCORE</div>' +
+            '<div class="mono" style="font-size:32px;font-weight:700;color:' + (d.buyScoreColor || '#ffd166') + '">' + (d.buyScore || 0) + '<span style="font-size:14px;color:#4a6070">/100</span></div>' +
+            '<div style="height:6px;background:#070a0f;border-radius:3px;overflow:hidden;margin:8px 0">' +
+              '<div style="height:100%;width:' + Math.min(d.buyScore || 0, 100) + '%;background:' + (d.buyScoreColor || '#ffd166') + ';border-radius:3px"></div>' +
+            '</div>' +
+            '<div style="font-size:10px;font-weight:600;color:' + (d.buyScoreColor || '#ffd166') + ';line-height:1.5">' + (d.buyScoreLabel || '') + '</div>' +
           '</div>' +
-          '<div style="font-size:12px;font-weight:600;color:' + scoreCol + '">' + d.scoreLabel + '</div>' +
-          '<div style="font-size:11px;color:#8aa0b0;margin-top:4px">' + d.regimeDesc + '</div>' +
+
         '</div>' +
 
-        // Two column: call strikes + support
-        '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">' +
-          '<div>' +
-            '<div style="font-size:10px;color:#39ff14;letter-spacing:2px;margin-bottom:10px">&#9650; BEST CALL STRIKES TO SELL</div>' +
-            (strikeRows || '<div style="color:#4a6070;font-size:12px">No resistance levels found</div>') +
-          '</div>' +
-          '<div>' +
-            '<div style="font-size:10px;color:#ff2d55;letter-spacing:2px;margin-bottom:10px">&#9660; KEY SUPPORT (PUT SIDE)</div>' +
-            (supportRows || '<div style="color:#4a6070;font-size:12px">No support levels found</div>') +
-          '</div>' +
+        // Regime description
+        '<div style="margin-bottom:16px;padding:10px 14px;background:#111820;border-left:3px solid ' + d.regimeColor + ';border-radius:0 6px 6px 0;font-size:12px;color:#8aa0b0">' +
+          d.regimeDesc +
         '</div>' +
 
-        // Trade rules reminder
-        '<div style="margin-top:16px;padding:10px 14px;background:rgba(0,212,255,0.05);border-left:3px solid rgba(0,212,255,0.3);border-radius:0 6px 6px 0;font-size:11px;color:#4a6070;line-height:1.8">' +
-          '&#9654; Sell calls AT or just above nearest GEX resistance &nbsp;·&nbsp; ' +
-          'Stop = close above GEX flip point &nbsp;·&nbsp; ' +
-          'Best in STRONG PIN / MILD PIN regime &nbsp;·&nbsp; ' +
-          'Avoid selling calls in TRENDING regime' +
+        // Three columns: sell strikes | buy levels | support
+        '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:16px">' +
+
+          // Sell call strikes
+          '<div>' +
+            '<div style="font-size:10px;color:#ff2d55;letter-spacing:1px;margin-bottom:10px">&#9660; SELL CALL STRIKES</div>' +
+            (strikeRows || '<div style="color:#4a6070;font-size:11px">No resistance found</div>') +
+          '</div>' +
+
+          // Buy call levels (support = dip entry for longs)
+          '<div>' +
+            '<div style="font-size:10px;color:#39ff14;letter-spacing:1px;margin-bottom:10px">&#9650; BUY CALL ENTRIES</div>' +
+            (function() {
+              return (d.callBuyLevels || []).map(function(s) {
+                var recCol = Math.abs(s.pctAway) < 2 ? '#ffd166' : '#8aa0b0';
+                return '<div style="padding:10px 0;border-bottom:1px solid #0d1f2d">' +
+                  '<div class="mono" style="font-size:16px;font-weight:700;color:#39ff14">$' + s.strike + '</div>' +
+                  '<div style="font-size:10px;color:#4a6070">' + s.pctAway + '% · $' + s.gexM + 'M GEX</div>' +
+                  '<div style="font-size:9px;color:' + recCol + ';margin-top:2px">' + s.recommendation + '</div>' +
+                '</div>';
+              }).join('') || '<div style="color:#4a6070;font-size:11px">No support found</div>';
+            })() +
+          '</div>' +
+
+          // Flip point context
+          '<div>' +
+            '<div style="font-size:10px;color:#ffd166;letter-spacing:1px;margin-bottom:10px">&#9646; KEY LEVELS</div>' +
+            '<div style="padding:10px 0;border-bottom:1px solid #0d1f2d">' +
+              '<div style="font-size:10px;color:#4a6070;margin-bottom:2px">GEX FLIP</div>' +
+              '<div class="mono" style="font-size:16px;font-weight:700;color:#ffd166">' + (d.flipPoint || 'N/A') + '</div>' +
+              '<div style="font-size:9px;color:#4a6070">regime change level</div>' +
+            '</div>' +
+            '<div style="padding:10px 0;border-bottom:1px solid #0d1f2d">' +
+              '<div style="font-size:10px;color:#4a6070;margin-bottom:2px">NET GEX</div>' +
+              '<div class="mono" style="font-size:16px;font-weight:700;color:' + d.regimeColor + '">' + (d.netGEXBillions >= 0 ? '+' : '') + d.netGEXBillions + 'B</div>' +
+            '</div>' +
+            '<div style="padding:10px 0">' +
+              '<div style="font-size:10px;color:#4a6070;margin-bottom:2px">CONTRACTS</div>' +
+              '<div class="mono" style="font-size:13px;color:#8aa0b0">' + (d.contractsUsed || 0) + ' used</div>' +
+            '</div>' +
+          '</div>' +
+
+        '</div>' +
+
+        // Trade rules — both playbooks
+        '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">' +
+          '<div style="padding:10px 12px;background:rgba(255,45,85,0.06);border-left:3px solid rgba(255,45,85,0.4);border-radius:0 6px 6px 0;font-size:10px;color:#8aa0b0;line-height:1.8">' +
+            '<div style="color:#ff2d55;font-weight:700;margin-bottom:4px">SELL CALLS RULES</div>' +
+            'Best in STRONG PIN / MILD PIN<br>' +
+            'Sell AT GEX resistance strike<br>' +
+            'Stop: close above flip point<br>' +
+            'Structure: credit spread or naked (if approved)' +
+          '</div>' +
+          '<div style="padding:10px 12px;background:rgba(57,255,20,0.06);border-left:3px solid rgba(57,255,20,0.4);border-radius:0 6px 6px 0;font-size:10px;color:#8aa0b0;line-height:1.8">' +
+            '<div style="color:#39ff14;font-weight:700;margin-bottom:4px">BUY CALLS RULES</div>' +
+            'Best in TRENDING (negative GEX)<br>' +
+            'Buy at GEX support / dip entry<br>' +
+            'Target: next GEX resistance above<br>' +
+            'Structure: debit spread or long call' +
+          '</div>' +
         '</div>' +
 
       '</div>';
