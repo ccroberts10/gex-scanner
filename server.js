@@ -875,6 +875,11 @@ async function runGEXScan(label) {
       if (combined.confluenceZones && combined.confluenceZones.length) {
         log('ok', 'Confluence zones found: ' + combined.confluenceZones.length);
       }
+      // Build conviction signal combining GEX + CTA
+      combined.conviction = buildConvictionSignal(combined, ctaState, combined.spotPrice);
+      if (combined.conviction) {
+        log('ok', 'Conviction: ' + combined.conviction.emoji + ' ' + combined.conviction.setup + ' (' + combined.conviction.conviction + '%) — ' + combined.conviction.tradeType);
+      }
       combined.ts       = new Date().toLocaleString('en-US', { timeZone: 'America/Denver', hour12: true });
       combined.runLabel = label;
       gexData    = combined;
@@ -1399,6 +1404,10 @@ async function scanTickerGEX(symbol) {
                      callScore >= 60 ? '#ffd166' :
                      callScore >= 40 ? '#ff6b35' : '#ff2d55';
 
+  // Build ticker-specific conviction using SPX CTA as proxy
+  const spxConviction = (gexData && gexData.conviction) ? gexData.conviction : null;
+  const tickerConviction = buildTickerConviction(gex, spxConviction);
+
   const result = {
     symbol,
     spotPrice,
@@ -1416,6 +1425,7 @@ async function scanTickerGEX(symbol) {
     buyScoreColor,
     callStrikes,
     callBuyLevels,
+    conviction: tickerConviction,
     topResistance: gex.topResistance,
     topSupport: gex.topSupport,
     topLevels: gex.topLevels,
@@ -1426,6 +1436,220 @@ async function scanTickerGEX(symbol) {
   tickerCache[symbol] = { data: result, ts: Date.now() };
   log('ok', symbol + ' GEX done — score: ' + callScore + ' | regime: ' + gex.regime + ' | flip: ' + gex.flipPoint);
   return result;
+}
+
+
+// ─── CONVICTION SIGNAL ENGINE ─────────────────────────────────────────────────
+// Cross-references GEX regime + CTA positioning + price vs flip point
+// Returns a structured conviction signal with trade instruction
+
+function buildConvictionSignal(gexData, ctaData, spotPrice) {
+  if (!gexData || !spotPrice) return null;
+
+  const netGEX      = gexData.netGEXBillions || 0;
+  const flipPoint   = gexData.flipPoint || null;
+  const regime      = gexData.regime || 'UNKNOWN';
+  const composite   = ctaData && ctaData.composite !== null ? ctaData.composite : null;
+  const aboveFlip   = flipPoint ? spotPrice > flipPoint : null;
+
+  // ── Step 1: GEX signal ──────────────────────────────────────────────────────
+  let gexSignal = 'NEUTRAL';
+  let gexStrength = 0; // -3 to +3
+  if      (netGEX > 2)   { gexSignal = 'PIN';        gexStrength = 3;  }
+  else if (netGEX > 0)   { gexSignal = 'MILD_PIN';   gexStrength = 1;  }
+  else if (netGEX > -2)  { gexSignal = 'MILD_TREND'; gexStrength = -1; }
+  else                   { gexSignal = 'TREND';       gexStrength = -3; }
+
+  // ── Step 2: CTA signal ──────────────────────────────────────────────────────
+  let ctaSignal = 'NEUTRAL';
+  let ctaStrength = 0; // -3 to +3
+  if (composite !== null) {
+    if      (composite >= 60)  { ctaSignal = 'CROWDED_LONG';  ctaStrength = 3;  }
+    else if (composite >= 25)  { ctaSignal = 'LONG';          ctaStrength = 2;  }
+    else if (composite >= -25) { ctaSignal = 'NEUTRAL';       ctaStrength = 0;  }
+    else if (composite >= -60) { ctaSignal = 'SHORT';         ctaStrength = -2; }
+    else                       { ctaSignal = 'CROWDED_SHORT'; ctaStrength = -3; }
+  }
+
+  // ── Step 3: Flip point context ──────────────────────────────────────────────
+  let flipContext = 'UNKNOWN';
+  let flipStrength = 0;
+  if (aboveFlip === true)  { flipContext = 'ABOVE_FLIP'; flipStrength = 1;  }
+  if (aboveFlip === false) { flipContext = 'BELOW_FLIP'; flipStrength = -1; }
+
+  // ── Step 4: Combined conviction ─────────────────────────────────────────────
+  // Add up all signals. Positive = bullish bias, negative = bearish bias
+  const bullScore = ctaStrength + flipStrength;
+  const isNegGEX  = gexStrength < 0;
+  const isPosGEX  = gexStrength > 0;
+
+  let setup = 'NEUTRAL';
+  let conviction = 0; // 0-100
+  let direction = 'NEUTRAL';
+  let tradeType = '';
+  let structure = '';
+  let entry = '';
+  let target = '';
+  let stop = '';
+  let color = '#ffd166';
+  let emoji = '⚪';
+
+  // ── The four high-conviction combos ────────────────────────────────────────
+  if (isNegGEX && bullScore >= 2) {
+    // EXPLOSIVE RALLY: negative GEX + CTA long + above flip
+    setup = 'EXPLOSIVE RALLY';
+    direction = 'BULLISH';
+    conviction = Math.min(50 + Math.abs(netGEX) * 5 + bullScore * 10, 99);
+    tradeType = 'BUY CALLS';
+    const nearResist = gexData.topResistance && gexData.topResistance[0];
+    const nextResist = gexData.topResistance && gexData.topResistance[1];
+    entry = nearResist ? 'Buy calls at ' + spotPrice + ' — momentum entry' : 'Buy calls at market';
+    target = nextResist ? 'Target: ' + nextResist.strike + ' (next GEX resistance)' : 'Target: next GEX resistance';
+    stop = flipPoint ? 'Stop: close below ' + flipPoint + ' (flip point)' : 'Stop: 1% below entry';
+    structure = 'Debit call spread or ATM long call — debit only in trending regime';
+    color = '#39ff14';
+    emoji = '🚀';
+  }
+  else if (isNegGEX && bullScore <= -2) {
+    // ACCELERATING SELLOFF: negative GEX + CTA short + below flip
+    setup = 'ACCELERATING SELLOFF';
+    direction = 'BEARISH';
+    conviction = Math.min(50 + Math.abs(netGEX) * 5 + Math.abs(bullScore) * 10, 99);
+    tradeType = 'BUY PUTS';
+    const nearSupport = gexData.topSupport && gexData.topSupport[0];
+    const nextSupport = gexData.topSupport && gexData.topSupport[1];
+    entry = 'Buy puts at ' + spotPrice + ' — breakdown entry';
+    target = nextSupport ? 'Target: ' + nextSupport.strike + ' (next GEX support)' : 'Target: next GEX support';
+    stop = flipPoint ? 'Stop: close above ' + flipPoint + ' (flip point)' : 'Stop: 1% above entry';
+    structure = 'Debit put spread or ATM long put — debit only in trending regime';
+    color = '#ff2d55';
+    emoji = '📉';
+  }
+  else if (isPosGEX && bullScore >= 1) {
+    // SLOW GRIND UP: positive GEX + CTA long — sell puts or call spreads
+    setup = 'GRIND HIGHER / PIN';
+    direction = 'MILD BULLISH';
+    conviction = Math.min(40 + gexStrength * 10 + bullScore * 8, 90);
+    tradeType = 'SELL CALLS / SELL PUT SPREAD';
+    const nearResist = gexData.topResistance && gexData.topResistance[0];
+    entry = nearResist ? 'Sell calls at ' + nearResist.strike + ' (GEX resistance)' : 'Sell OTM calls at nearest resistance';
+    target = 'Collect full premium — expect pin between GEX levels';
+    stop = flipPoint ? 'Stop: close below ' + flipPoint + ' (regime flip)' : 'Stop: break below nearest GEX support';
+    structure = 'Credit call spread above resistance OR sell put spread at support';
+    color = '#ffd166';
+    emoji = '📌';
+  }
+  else if (isPosGEX && bullScore <= -1) {
+    // FADE THE RIP: positive GEX + CTA short — sell calls into resistance
+    setup = 'FADE THE RIP';
+    direction = 'MILD BEARISH';
+    conviction = Math.min(40 + gexStrength * 10 + Math.abs(bullScore) * 8, 90);
+    tradeType = 'SELL CALLS';
+    const nearResist = gexData.topResistance && gexData.topResistance[0];
+    entry = nearResist ? 'Sell calls at ' + nearResist.strike + ' — GEX wall overhead' : 'Sell OTM calls at resistance';
+    target = 'Collect full premium — dealers suppress move';
+    stop = flipPoint ? 'Stop: close above ' + flipPoint + ' (regime flip)' : 'Stop: break above nearest resistance';
+    structure = 'Credit call spread — pinning regime so time decay works for you';
+    color = '#ff6b35';
+    emoji = '🎯';
+  }
+  else {
+    // Mixed signals
+    setup = 'MIXED SIGNALS';
+    direction = 'NEUTRAL';
+    conviction = 20;
+    tradeType = 'STAND ASIDE';
+    entry = 'No clear edge — wait for alignment';
+    target = 'Wait for GEX and CTA to agree';
+    stop = 'N/A';
+    structure = 'No trade — mixed signals reduce edge significantly';
+    color = '#4a6070';
+    emoji = '⚠';
+  }
+
+  // Double-confirmed bonus: when GEX level and CTA trigger are at same price
+  let doubleConfirmed = false;
+  if (ctaData && ctaData.triggers && gexData.topResistance) {
+    const ctaTriggerPrices = (ctaData.triggers || []).map(function(t) { return t.level * 10; }); // SPY to SPX
+    const gexPrices = (gexData.topResistance || []).concat(gexData.topSupport || []).map(function(s) { return s.strike; });
+    for (var i = 0; i < ctaTriggerPrices.length; i++) {
+      for (var j = 0; j < gexPrices.length; j++) {
+        if (Math.abs(ctaTriggerPrices[i] - gexPrices[j]) <= 20) {
+          doubleConfirmed = true;
+          break;
+        }
+      }
+    }
+  }
+  if (doubleConfirmed) conviction = Math.min(conviction + 10, 99);
+
+  return {
+    setup, direction, conviction, tradeType, color, emoji,
+    entry, target, stop, structure, doubleConfirmed,
+    gexSignal, gexStrength, ctaSignal, ctaStrength,
+    flipContext, aboveFlip, composite, netGEX, flipPoint,
+    regime, spotPrice,
+  };
+}
+
+// Ticker-specific conviction (GEX only — no CTA for individual stocks)
+function buildTickerConviction(tickerGEX, spxConviction) {
+  if (!tickerGEX) return null;
+
+  const netGEX    = tickerGEX.netGEXBillions || 0;
+  const flipPoint = tickerGEX.flipPoint || null;
+  const spot      = tickerGEX.spotPrice;
+  const aboveFlip = flipPoint ? spot > flipPoint : null;
+
+  // Use SPX CTA as proxy for individual stock trend-follower direction
+  // (CTAs trade index futures which drive individual stock flow)
+  const ctaProxy  = spxConviction ? spxConviction.ctaStrength : 0;
+  const bullScore = ctaProxy + (aboveFlip === true ? 1 : aboveFlip === false ? -1 : 0);
+
+  let setup, direction, conviction, tradeType, entry, target, stop, structure, color, emoji;
+
+  const isNegGEX = netGEX < 0;
+  const isPosGEX = netGEX > 0;
+
+  if (isNegGEX && bullScore >= 1) {
+    setup = 'BUY CALLS'; direction = 'BULLISH';
+    conviction = Math.min(45 + Math.abs(netGEX) * 8 + bullScore * 8, 95);
+    tradeType = 'LONG CALL / DEBIT CALL SPREAD';
+    const r = tickerGEX.topResistance && tickerGEX.topResistance[0];
+    entry = 'Enter at $' + spot + ' with momentum';
+    target = r ? 'Target: $' + r.strike + ' (GEX resistance)' : 'Target: next GEX resistance';
+    stop = flipPoint ? 'Stop: close below $' + flipPoint : 'Stop: -2% from entry';
+    structure = 'Debit call spread — buy ATM, sell at nearest resistance';
+    color = '#39ff14'; emoji = '🚀';
+  } else if (isNegGEX && bullScore <= -1) {
+    setup = 'BUY PUTS'; direction = 'BEARISH';
+    conviction = Math.min(45 + Math.abs(netGEX) * 8 + Math.abs(bullScore) * 8, 95);
+    tradeType = 'LONG PUT / DEBIT PUT SPREAD';
+    const s = tickerGEX.topSupport && tickerGEX.topSupport[0];
+    entry = 'Enter at $' + spot + ' on breakdown';
+    target = s ? 'Target: $' + s.strike + ' (GEX support)' : 'Target: next GEX support';
+    stop = flipPoint ? 'Stop: close above $' + flipPoint : 'Stop: +2% from entry';
+    structure = 'Debit put spread — buy ATM, sell at nearest support';
+    color = '#ff2d55'; emoji = '📉';
+  } else if (isPosGEX) {
+    setup = 'SELL CALLS'; direction = 'NEUTRAL/BEARISH';
+    conviction = Math.min(40 + netGEX * 8, 85);
+    tradeType = 'CREDIT CALL SPREAD';
+    const r = tickerGEX.topResistance && tickerGEX.topResistance[0];
+    entry = r ? 'Sell calls at $' + r.strike + ' (GEX resistance wall)' : 'Sell OTM calls at resistance';
+    target = 'Collect full premium — pin expected';
+    stop = flipPoint ? 'Stop: close above $' + flipPoint : 'Stop: break above resistance';
+    structure = 'Credit call spread at GEX resistance — theta works for you';
+    color = '#ffd166'; emoji = '📌';
+  } else {
+    setup = 'NEUTRAL'; direction = 'MIXED';
+    conviction = 20; tradeType = 'STAND ASIDE';
+    entry = 'No clear signal'; target = 'Wait'; stop = 'N/A';
+    structure = 'Mixed GEX signals — no trade';
+    color = '#4a6070'; emoji = '⚪';
+  }
+
+  return { setup, direction, conviction, tradeType, entry, target, stop, structure, color, emoji, netGEX, flipPoint, aboveFlip, spot };
 }
 
 // ─── SCHEDULER ────────────────────────────────────────────────────────────────
@@ -1592,6 +1816,50 @@ ${d.marketContext ? `
     </div>
     ` : ''}
 
+  </div>
+</div>
+` : ''}
+
+${(d.conviction && d.conviction.setup !== 'NEUTRAL') ? `
+<!-- CONVICTION SIGNAL -->
+<div class="card" style="margin-bottom:16px;border-color:${d.conviction.color}40">
+  <div class="card-head" style="background:${d.conviction.color}10">
+    <span class="card-title" style="color:${d.conviction.color}">${d.conviction.emoji} CONVICTION SIGNAL — ${d.conviction.setup}</span>
+    <span style="font-size:12px;font-weight:700;color:${d.conviction.color}">${d.conviction.conviction}% CONVICTION</span>
+  </div>
+  <div style="padding:18px 20px">
+    <div style="height:8px;background:#070a0f;border-radius:4px;overflow:hidden;margin-bottom:16px">
+      <div style="height:100%;width:${d.conviction.conviction}%;background:${d.conviction.color};border-radius:4px"></div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px">
+      <div style="padding:12px 14px;background:#111820;border-radius:8px;border-left:3px solid ${d.conviction.color}">
+        <div style="font-size:10px;color:#4a6070;letter-spacing:1px;margin-bottom:4px">TRADE TYPE</div>
+        <div style="font-size:14px;font-weight:700;color:${d.conviction.color}">${d.conviction.tradeType}</div>
+      </div>
+      <div style="padding:12px 14px;background:#111820;border-radius:8px;border-left:3px solid #1a2535">
+        <div style="font-size:10px;color:#4a6070;letter-spacing:1px;margin-bottom:4px">SIGNALS ALIGNED</div>
+        <div style="font-size:12px;color:#d8eaf5">GEX: ${d.conviction.gexSignal} &nbsp;&middot;&nbsp; CTA: ${d.conviction.ctaSignal}</div>
+        <div style="font-size:11px;color:#4a6070;margin-top:2px">Flip: ${d.conviction.flipContext.replace('_', ' ')}</div>
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:14px">
+      <div style="padding:10px 12px;background:#111820;border-radius:6px">
+        <div style="font-size:9px;color:#4a6070;letter-spacing:1px;margin-bottom:4px">ENTRY</div>
+        <div style="font-size:11px;color:#d8eaf5">${d.conviction.entry}</div>
+      </div>
+      <div style="padding:10px 12px;background:#111820;border-radius:6px">
+        <div style="font-size:9px;color:#39ff14;letter-spacing:1px;margin-bottom:4px">TARGET</div>
+        <div style="font-size:11px;color:#d8eaf5">${d.conviction.target}</div>
+      </div>
+      <div style="padding:10px 12px;background:#111820;border-radius:6px">
+        <div style="font-size:9px;color:#ff2d55;letter-spacing:1px;margin-bottom:4px">STOP</div>
+        <div style="font-size:11px;color:#d8eaf5">${d.conviction.stop}</div>
+      </div>
+    </div>
+    <div style="padding:10px 14px;background:rgba(0,212,255,0.05);border-left:3px solid rgba(0,212,255,0.3);border-radius:0 6px 6px 0;font-size:12px;color:#00d4ff">
+      &#9654; ${d.conviction.structure}
+    </div>
+    ${d.conviction.doubleConfirmed ? `<div style="margin-top:10px;padding:8px 12px;background:rgba(255,107,53,0.1);border-radius:6px;font-size:11px;font-weight:700;color:#ff6b35;letter-spacing:1px">&#9889; DOUBLE CONFIRMED — GEX level aligns with CTA trigger. Highest conviction.</div>` : ''}
   </div>
 </div>
 ` : ''}
@@ -2065,6 +2333,37 @@ function scanTicker(btn) {
             '<div style="font-size:11px;color:#4a6070">regime change level</div>' +
           '</div>' +
         '</div>' +
+
+        // Conviction signal block
+        (d.conviction && d.conviction.setup !== 'NEUTRAL' ? (
+          '<div style="margin-bottom:16px;padding:14px 16px;background:' + d.conviction.color + '10;border-radius:8px;border:1px solid ' + d.conviction.color + '40">' +
+            '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">' +
+              '<div style="font-size:13px;font-weight:700;color:' + d.conviction.color + '">' + d.conviction.emoji + ' ' + d.conviction.setup + '</div>' +
+              '<div style="font-size:12px;font-weight:700;color:' + d.conviction.color + '">' + d.conviction.conviction + '% CONVICTION</div>' +
+            '</div>' +
+            '<div style="height:6px;background:#070a0f;border-radius:3px;overflow:hidden;margin-bottom:12px">' +
+              '<div style="height:100%;width:' + d.conviction.conviction + '%;background:' + d.conviction.color + ';border-radius:3px"></div>' +
+            '</div>' +
+            '<div style="font-size:12px;font-weight:700;color:' + d.conviction.color + ';margin-bottom:8px">' + d.conviction.tradeType + '</div>' +
+            '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:10px">' +
+              '<div style="padding:8px;background:#111820;border-radius:6px">' +
+                '<div style="font-size:9px;color:#4a6070;margin-bottom:3px">ENTRY</div>' +
+                '<div style="font-size:10px;color:#d8eaf5">' + d.conviction.entry + '</div>' +
+              '</div>' +
+              '<div style="padding:8px;background:#111820;border-radius:6px">' +
+                '<div style="font-size:9px;color:#39ff14;margin-bottom:3px">TARGET</div>' +
+                '<div style="font-size:10px;color:#d8eaf5">' + d.conviction.target + '</div>' +
+              '</div>' +
+              '<div style="padding:8px;background:#111820;border-radius:6px">' +
+                '<div style="font-size:9px;color:#ff2d55;margin-bottom:3px">STOP</div>' +
+                '<div style="font-size:10px;color:#d8eaf5">' + d.conviction.stop + '</div>' +
+              '</div>' +
+            '</div>' +
+            '<div style="font-size:10px;color:#00d4ff;padding:6px 10px;background:rgba(0,212,255,0.05);border-radius:4px">' +
+              '&#9654; ' + d.conviction.structure +
+            '</div>' +
+          '</div>'
+        ) : '') +
 
         // Dual score cards
         '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:20px">' +
