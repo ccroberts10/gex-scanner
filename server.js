@@ -1270,6 +1270,84 @@ function renderCTASection() {
 // ─── TICKER GEX SCANNER ──────────────────────────────────────────────────────
 let tickerCache = {}; // { SYMBOL: { data, ts } }
 
+
+// ─── EARNINGS PROXIMITY CHECK (Alpaca) ───────────────────────────────────────
+async function fetchEarningsDate(symbol) {
+  try {
+    // Alpaca corporate actions / announcements endpoint
+    const url = 'https://data.alpaca.markets/v1beta1/corporate-actions/announcements' +
+      '?ca_types=Dividend&symbols=' + encodeURIComponent(symbol) +
+      '&since=' + new Date().toISOString().slice(0,10);
+    // Note: Alpaca doesn't have earnings dates directly — use Tradier options chain
+    // to detect earnings proximity via IV skew. Alternatively use a known proxy:
+    // if the nearest expiry IV is dramatically higher than next expiry, earnings are near.
+
+    if (!CONFIG.tradierToken) return null;
+
+    // Get two expiry chains and compare IV levels
+    const expRes = await fetch(
+      'https://api.tradier.com/v1/markets/options/expirations?symbol=' + symbol + '&includeAllRoots=true',
+      { headers: { 'Authorization': 'Bearer ' + CONFIG.tradierToken, 'Accept': 'application/json' } }
+    );
+    if (!expRes.ok) return null;
+    const expJson = await expRes.json();
+    const exps = expJson.expirations && expJson.expirations.date;
+    if (!exps) return null;
+    const expList = Array.isArray(exps) ? exps : [exps];
+    if (expList.length < 2) return null;
+
+    // Fetch ATM straddle for first two expiries
+    const spot = null; // already have it in caller
+    const ivData = [];
+    for (const exp of expList.slice(0, 2)) {
+      try {
+        const chainRes = await fetch(
+          'https://api.tradier.com/v1/markets/options/chains?symbol=' + symbol + '&expiration=' + exp + '&greeks=false',
+          { headers: { 'Authorization': 'Bearer ' + CONFIG.tradierToken, 'Accept': 'application/json' } }
+        );
+        if (!chainRes.ok) continue;
+        const chain = await chainRes.json();
+        const opts = (chain.options && chain.options.option) || [];
+        // Get IV from options - use mid of all IVs as proxy
+        const ivs = opts.filter(function(o) { return o.greeks && o.greeks.mid_iv && o.greeks.mid_iv > 0; })
+                       .map(function(o) { return o.greeks.mid_iv; });
+        if (ivs.length) {
+          const avgIV = ivs.reduce(function(a,b) { return a+b; }, 0) / ivs.length;
+          const today = new Date(); today.setHours(0,0,0,0);
+          const expDate = new Date(exp + 'T00:00:00');
+          const dte = Math.round((expDate - today) / (1000*60*60*24));
+          ivData.push({ exp, dte, avgIV });
+        }
+        await new Promise(function(r) { setTimeout(r, 200); });
+      } catch(e) { /* skip */ }
+    }
+
+    if (ivData.length < 2) return null;
+
+    // Earnings signal: if near-term IV is >40% higher than next expiry IV (normalized for time)
+    const near = ivData[0];
+    const next = ivData[1];
+    const ivRatio = near.avgIV / (next.avgIV || 1);
+    const earningsSoon = ivRatio > 1.35 && near.dte <= 14;
+
+    return {
+      nearExpiry: near.exp,
+      nearDTE: near.dte,
+      nearIV: Math.round(near.avgIV * 100),
+      nextExpiry: next.exp,
+      nextIV: Math.round(next.avgIV * 100),
+      ivRatio: Math.round(ivRatio * 100) / 100,
+      earningsSoon,
+      warning: earningsSoon ?
+        'EARNINGS LIKELY WITHIN ' + near.dte + ' DAYS — IV elevated ' + Math.round((ivRatio-1)*100) + '% above next expiry. GEX less reliable. Avoid selling premium.' :
+        null,
+    };
+  } catch(e) {
+    log('warn', 'fetchEarningsDate ' + symbol + ': ' + e.message);
+    return null;
+  }
+}
+
 async function scanTickerGEX(symbol) {
   symbol = symbol.toUpperCase().trim();
   if (!symbol || symbol.length > 6) throw new Error('Invalid symbol');
@@ -1404,9 +1482,14 @@ async function scanTickerGEX(symbol) {
                      callScore >= 60 ? '#ffd166' :
                      callScore >= 40 ? '#ff6b35' : '#ff2d55';
 
-  // Build ticker-specific conviction using SPX CTA as proxy
-  const spxConviction = (gexData && gexData.conviction) ? gexData.conviction : null;
-  const tickerConviction = buildTickerConviction(gex, spxConviction);
+  // Earnings proximity check (runs in parallel with conviction)
+  const earningsData = await fetchEarningsDate(symbol).catch(function() { return null; });
+  if (earningsData && earningsData.earningsSoon) {
+    log('warn', symbol + ' EARNINGS SOON — IV ratio: ' + earningsData.ivRatio + ' | DTE: ' + earningsData.nearDTE);
+  }
+
+  // Build ticker-specific conviction — pass ctaState directly so CTA composite is always current
+  const tickerConviction = buildTickerConviction(gex, ctaState);
 
   const result = {
     symbol,
@@ -1426,6 +1509,7 @@ async function scanTickerGEX(symbol) {
     callStrikes,
     callBuyLevels,
     conviction: tickerConviction,
+    earnings: earningsData,
     topResistance: gex.topResistance,
     topSupport: gex.topSupport,
     topLevels: gex.topLevels,
@@ -1592,8 +1676,8 @@ function buildConvictionSignal(gexData, ctaData, spotPrice) {
   };
 }
 
-// Ticker-specific conviction (GEX only — no CTA for individual stocks)
-function buildTickerConviction(tickerGEX, spxConviction) {
+// Ticker-specific conviction — GEX + SPX CTA as market environment proxy
+function buildTickerConviction(tickerGEX, ctaState) {
   if (!tickerGEX) return null;
 
   const netGEX    = tickerGEX.netGEXBillions || 0;
@@ -1601,10 +1685,23 @@ function buildTickerConviction(tickerGEX, spxConviction) {
   const spot      = tickerGEX.spotPrice;
   const aboveFlip = flipPoint ? spot > flipPoint : null;
 
-  // Use SPX CTA as proxy for individual stock trend-follower direction
-  // (CTAs trade index futures which drive individual stock flow)
-  const ctaProxy  = spxConviction ? spxConviction.ctaStrength : 0;
-  const bullScore = ctaProxy + (aboveFlip === true ? 1 : aboveFlip === false ? -1 : 0);
+  // CTA composite from live ctaState — SPX CTA is the best proxy for
+  // individual stock institutional trend-following flow direction
+  const composite = ctaState && ctaState.composite !== null ? ctaState.composite : null;
+  let ctaStrength = 0;
+  if (composite !== null) {
+    if      (composite >= 60)  ctaStrength = 3;
+    else if (composite >= 25)  ctaStrength = 2;
+    else if (composite >= -25) ctaStrength = 0;
+    else if (composite >= -60) ctaStrength = -2;
+    else                       ctaStrength = -3;
+  }
+  const ctaLabel = composite !== null ?
+    (composite >= 25 ? 'LONG (' + composite + ')' :
+     composite <= -25 ? 'SHORT (' + composite + ')' :
+     'NEUTRAL (' + composite + ')') : 'N/A';
+
+  const bullScore = ctaStrength + (aboveFlip === true ? 1 : aboveFlip === false ? -1 : 0);
 
   let setup, direction, conviction, tradeType, entry, target, stop, structure, color, emoji;
 
@@ -1649,7 +1746,7 @@ function buildTickerConviction(tickerGEX, spxConviction) {
     color = '#4a6070'; emoji = '⚪';
   }
 
-  return { setup, direction, conviction, tradeType, entry, target, stop, structure, color, emoji, netGEX, flipPoint, aboveFlip, spot };
+  return { setup, direction, conviction, tradeType, entry, target, stop, structure, color, emoji, netGEX, flipPoint, aboveFlip, spot, ctaLabel, ctaStrength, composite };
 }
 
 // ─── SCHEDULER ────────────────────────────────────────────────────────────────
@@ -2334,6 +2431,19 @@ function scanTicker(btn) {
           '</div>' +
         '</div>' +
 
+        // Earnings warning — show first if earnings are near
+        (d.earnings && d.earnings.earningsSoon ? (
+          '<div style="margin-bottom:14px;padding:12px 14px;background:rgba(255,107,53,0.12);border:1px solid rgba(255,107,53,0.4);border-radius:8px">' +
+            '<div style="font-size:11px;font-weight:700;color:#ff6b35;letter-spacing:1px;margin-bottom:4px">&#9888; EARNINGS WARNING</div>' +
+            '<div style="font-size:11px;color:#d8eaf5">' + d.earnings.warning + '</div>' +
+            '<div style="font-size:10px;color:#4a6070;margin-top:6px">' +
+              'Near IV: ' + d.earnings.nearIV + '% (' + d.earnings.nearExpiry + ', DTE ' + d.earnings.nearDTE + ') &nbsp;·&nbsp; ' +
+              'Next IV: ' + d.earnings.nextIV + '% (' + d.earnings.nextExpiry + ') &nbsp;·&nbsp; ' +
+              'IV ratio: ' + d.earnings.ivRatio + 'x' +
+            '</div>' +
+          '</div>'
+        ) : '') +
+
         // Conviction signal block
         (d.conviction && d.conviction.setup !== 'NEUTRAL' ? (
           '<div style="margin-bottom:16px;padding:14px 16px;background:' + d.conviction.color + '10;border-radius:8px;border:1px solid ' + d.conviction.color + '40">' +
@@ -2343,6 +2453,24 @@ function scanTicker(btn) {
             '</div>' +
             '<div style="height:6px;background:#070a0f;border-radius:3px;overflow:hidden;margin-bottom:12px">' +
               '<div style="height:100%;width:' + d.conviction.conviction + '%;background:' + d.conviction.color + ';border-radius:3px"></div>' +
+            '</div>' +
+            // CTA context row
+            '<div style="display:flex;gap:16px;margin-bottom:10px;padding:8px 10px;background:#0c1118;border-radius:6px">' +
+              '<div>' +
+                '<div style="font-size:9px;color:#4a6070;letter-spacing:1px;margin-bottom:2px">SPX CTA</div>' +
+                '<div style="font-size:11px;font-weight:700;color:' +
+                  (d.conviction.ctaStrength > 0 ? '#39ff14' : d.conviction.ctaStrength < 0 ? '#ff2d55' : '#ffd166') + '">' +
+                  (d.conviction.ctaLabel || 'N/A') +
+                '</div>' +
+              '</div>' +
+              '<div>' +
+                '<div style="font-size:9px;color:#4a6070;letter-spacing:1px;margin-bottom:2px">TICKER GEX</div>' +
+                '<div style="font-size:11px;font-weight:700;color:' + d.regimeColor + '">' + d.regime + ' (' + (d.netGEXBillions >= 0 ? '+' : '') + d.netGEXBillions + 'B)</div>' +
+              '</div>' +
+              '<div>' +
+                '<div style="font-size:9px;color:#4a6070;letter-spacing:1px;margin-bottom:2px">VS FLIP</div>' +
+                '<div style="font-size:11px;font-weight:700;color:#ffd166">' + (d.conviction.aboveFlip === true ? 'ABOVE' : d.conviction.aboveFlip === false ? 'BELOW' : 'N/A') + ' $' + (d.flipPoint || 'N/A') + '</div>' +
+              '</div>' +
             '</div>' +
             '<div style="font-size:12px;font-weight:700;color:' + d.conviction.color + ';margin-bottom:8px">' + d.conviction.tradeType + '</div>' +
             '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:10px">' +
