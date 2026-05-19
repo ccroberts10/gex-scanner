@@ -1638,15 +1638,18 @@ function buildConvictionSignal(gexData, ctaData, spotPrice) {
     emoji = '🎯';
   }
   else {
-    // Mixed signals
+    // Mixed signals — describe the specific conflict
     setup = 'MIXED SIGNALS';
     direction = 'NEUTRAL';
     conviction = 20;
     tradeType = 'STAND ASIDE';
-    entry = 'No clear edge — wait for alignment';
-    target = 'Wait for GEX and CTA to agree';
-    stop = 'N/A';
-    structure = 'No trade — mixed signals reduce edge significantly';
+    var gexDesc  = gexStrength > 0 ? 'GEX pinning' : gexStrength < 0 ? 'GEX trending' : 'GEX neutral';
+    var ctaDesc  = ctaStrength > 0 ? 'CTA long' : ctaStrength < 0 ? 'CTA short' : 'CTA neutral';
+    var flipDesc = flipContext === 'ABOVE_FLIP' ? 'above flip' : flipContext === 'BELOW_FLIP' ? 'below flip' : 'flip N/A';
+    entry     = gexDesc + ' but ' + ctaDesc + ' — no directional alignment';
+    target    = 'Wait for GEX + CTA to agree before entering';
+    stop      = 'N/A — no position';
+    structure = 'Stand aside. ' + gexDesc + ', ' + ctaDesc + ', price ' + flipDesc + '. Enter only when all three align.';
     color = '#4a6070';
     emoji = '⚠';
   }
@@ -1665,6 +1668,9 @@ function buildConvictionSignal(gexData, ctaData, spotPrice) {
       }
     }
   }
+  // Double confirmed is only meaningful when we have a real setup
+  // Suppress it on MIXED SIGNALS — contradictory messaging
+  if (setup === 'MIXED SIGNALS') doubleConfirmed = false;
   if (doubleConfirmed) conviction = Math.min(conviction + 10, 99);
 
   return {
