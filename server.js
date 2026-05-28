@@ -1943,7 +1943,80 @@ ${d.marketContext ? `
 ` : ''}
 
 ${(d.conviction && d.conviction.setup !== 'NEUTRAL') ? `
+
 <!-- CONVICTION SIGNAL -->
+${(d.conviction.setup === 'EXPLOSIVE RALLY' || d.conviction.setup === 'ACCELERATING SELLOFF') ? `
+
+<!-- DIRECTIONAL ALERT BANNER — shown prominently for high conviction directional setups -->
+<div style="margin-bottom:16px;padding:0;border-radius:12px;overflow:hidden;box-shadow:0 0 30px ${d.conviction.color}40">
+  <!-- Pulsing top bar -->
+  <div style="height:4px;background:${d.conviction.color};animation:pulse 1.5s infinite"></div>
+  <div style="background:${d.conviction.color}18;border:2px solid ${d.conviction.color}60;border-top:none;border-radius:0 0 12px 12px;padding:20px">
+
+    <!-- Big directional header -->
+    <div style="text-align:center;margin-bottom:18px">
+      <div style="font-size:32px;margin-bottom:6px">${d.conviction.emoji}</div>
+      <div style="font-size:22px;font-weight:700;color:${d.conviction.color};letter-spacing:2px">${d.conviction.setup}</div>
+      <div style="font-size:13px;color:#8aa0b0;margin-top:4px">${d.conviction.direction} &nbsp;&middot;&nbsp; ${d.conviction.conviction}% CONVICTION</div>
+    </div>
+
+    <!-- Conviction bar -->
+    <div style="height:10px;background:#070a0f;border-radius:5px;overflow:hidden;margin-bottom:18px">
+      <div style="height:100%;width:${d.conviction.conviction}%;background:${d.conviction.color};border-radius:5px;box-shadow:0 0 10px ${d.conviction.color}80"></div>
+    </div>
+
+    <!-- Trade type big -->
+    <div style="text-align:center;margin-bottom:18px;padding:14px;background:${d.conviction.color}20;border-radius:8px;border:1px solid ${d.conviction.color}40">
+      <div style="font-size:10px;color:#4a6070;letter-spacing:2px;margin-bottom:6px">TRADE TYPE</div>
+      <div style="font-size:24px;font-weight:700;color:${d.conviction.color}">${d.conviction.tradeType}</div>
+      <div style="font-size:11px;color:#8aa0b0;margin-top:6px">${d.conviction.structure}</div>
+    </div>
+
+    <!-- Signals row -->
+    <div style="display:flex;justify-content:center;gap:20px;margin-bottom:18px;flex-wrap:wrap">
+      <div style="text-align:center">
+        <div style="font-size:9px;color:#4a6070;letter-spacing:1px;margin-bottom:3px">GEX</div>
+        <div style="font-size:12px;font-weight:700;color:${d.conviction.color}">${d.conviction.gexSignal}</div>
+      </div>
+      <div style="color:#1a2535;font-size:20px">|</div>
+      <div style="text-align:center">
+        <div style="font-size:9px;color:#4a6070;letter-spacing:1px;margin-bottom:3px">CTA</div>
+        <div style="font-size:12px;font-weight:700;color:${d.conviction.color}">${d.conviction.ctaSignal}</div>
+      </div>
+      <div style="color:#1a2535;font-size:20px">|</div>
+      <div style="text-align:center">
+        <div style="font-size:9px;color:#4a6070;letter-spacing:1px;margin-bottom:3px">FLIP</div>
+        <div style="font-size:12px;font-weight:700;color:#ffd166">${d.conviction.flipContext.replace('_',' ')}</div>
+      </div>
+    </div>
+
+    <!-- Entry / Target / Stop -->
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:14px">
+      <div style="padding:10px 12px;background:#0c1118;border-radius:8px;border-top:2px solid #4a6070">
+        <div style="font-size:9px;color:#4a6070;letter-spacing:1px;margin-bottom:4px">ENTRY</div>
+        <div style="font-size:11px;color:#d8eaf5">${d.conviction.entry}</div>
+      </div>
+      <div style="padding:10px 12px;background:#0c1118;border-radius:8px;border-top:2px solid #39ff14">
+        <div style="font-size:9px;color:#39ff14;letter-spacing:1px;margin-bottom:4px">TARGET</div>
+        <div style="font-size:11px;color:#d8eaf5">${d.conviction.target}</div>
+      </div>
+      <div style="padding:10px 12px;background:#0c1118;border-radius:8px;border-top:2px solid #ff2d55">
+        <div style="font-size:9px;color:#ff2d55;letter-spacing:1px;margin-bottom:4px">STOP</div>
+        <div style="font-size:11px;color:#d8eaf5">${d.conviction.stop}</div>
+      </div>
+    </div>
+
+    ${d.conviction.doubleConfirmed ? `
+    <div style="padding:10px 14px;background:rgba(255,107,53,0.15);border:1px solid rgba(255,107,53,0.5);border-radius:8px;font-size:12px;font-weight:700;color:#ff6b35;text-align:center;letter-spacing:1px">
+      &#9889; DOUBLE CONFIRMED — GEX level aligns with CTA trigger. Highest conviction.
+    </div>` : ''}
+
+  </div>
+</div>
+
+` : `
+
+<!-- STANDARD CONVICTION CARD — for premium selling / mixed setups -->
 <div class="card" style="margin-bottom:16px;border-color:${d.conviction.color}40">
   <div class="card-head" style="background:${d.conviction.color}10">
     <span class="card-title" style="color:${d.conviction.color}">${d.conviction.emoji} CONVICTION SIGNAL — ${d.conviction.setup}</span>
@@ -1984,6 +2057,8 @@ ${(d.conviction && d.conviction.setup !== 'NEUTRAL') ? `
     ${d.conviction.doubleConfirmed ? `<div style="margin-top:10px;padding:8px 12px;background:rgba(255,107,53,0.1);border-radius:6px;font-size:11px;font-weight:700;color:#ff6b35;letter-spacing:1px">&#9889; DOUBLE CONFIRMED — GEX level aligns with CTA trigger. Highest conviction.</div>` : ''}
   </div>
 </div>
+
+`}
 ` : ''}
 
 ${d.aiRecap ? `
