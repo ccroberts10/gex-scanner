@@ -1613,7 +1613,7 @@ function buildConvictionSignal(gexData, ctaData, spotPrice) {
     // SLOW GRIND UP: positive GEX + CTA long — sell puts or call spreads
     setup = 'GRIND HIGHER / PIN';
     direction = 'MILD BULLISH';
-    conviction = Math.min(40 + gexStrength * 10 + bullScore * 8, 90);
+    conviction = Math.min(55 + gexStrength * 12 + bullScore * 8, 95);
     tradeType = 'SELL CALLS / SELL PUT SPREAD';
     const nearResist = gexData.topResistance && gexData.topResistance[0];
     entry = nearResist ? 'Sell calls at ' + nearResist.strike + ' (GEX resistance)' : 'Sell OTM calls at nearest resistance';
@@ -1624,18 +1624,37 @@ function buildConvictionSignal(gexData, ctaData, spotPrice) {
     emoji = '📌';
   }
   else if (isPosGEX && bullScore <= -1) {
-    // FADE THE RIP: positive GEX + CTA short — sell calls into resistance
+    // FADE THE RIP: positive GEX + CTA short
     setup = 'FADE THE RIP';
     direction = 'MILD BEARISH';
-    conviction = Math.min(40 + gexStrength * 10 + Math.abs(bullScore) * 8, 90);
+    conviction = Math.min(55 + gexStrength * 12 + Math.abs(bullScore) * 8, 95);
     tradeType = 'SELL CALLS';
-    const nearResist = gexData.topResistance && gexData.topResistance[0];
-    entry = nearResist ? 'Sell calls at ' + nearResist.strike + ' — GEX wall overhead' : 'Sell OTM calls at resistance';
+    const nearResistFade = gexData.topResistance && gexData.topResistance[0];
+    entry = nearResistFade ? 'Sell calls at ' + nearResistFade.strike + ' — GEX wall overhead' : 'Sell OTM calls at resistance';
     target = 'Collect full premium — dealers suppress move';
     stop = flipPoint ? 'Stop: close above ' + flipPoint + ' (regime flip)' : 'Stop: break above nearest resistance';
-    structure = 'Credit call spread — pinning regime so time decay works for you';
+    structure = 'Credit call spread — pinning regime, CTA also short, double pressure on upside';
     color = '#ff6b35';
     emoji = '🎯';
+  }
+  else if (isPosGEX) {
+    // PREMIUM SELLING: positive GEX + CTA neutral
+    // GEX is PRIMARY signal for premium selling — CTA neutral is perfectly fine
+    // Dealers are pinning price regardless of CTA direction
+    setup = 'PREMIUM SELLING';
+    direction = 'NEUTRAL / PIN';
+    conviction = Math.min(50 + gexStrength * 15, 90);
+    tradeType = 'SELL CALLS / SELL PUTS';
+    const nearResistPS = gexData.topResistance && gexData.topResistance[0];
+    const nearSupportPS = gexData.topSupport && gexData.topSupport[0];
+    entry = nearResistPS
+      ? 'Sell calls at ' + nearResistPS.strike + ' (GEX resistance) or sell puts at ' + (nearSupportPS ? nearSupportPS.strike : 'GEX support')
+      : 'Sell at nearest GEX resistance (calls) or support (puts)';
+    target = 'Collect full premium — pinning regime, theta decay works for you';
+    stop = flipPoint ? 'Stop: regime flip at ' + flipPoint + ' — close if breached' : 'Stop: regime changes to TRENDING';
+    structure = 'Credit call spread above GEX resistance OR cash-secured put at GEX support. CTA neutral = no momentum to fight you.';
+    color = '#39ff14';
+    emoji = '💰';
   }
   else {
     // Mixed signals — describe the specific conflict
