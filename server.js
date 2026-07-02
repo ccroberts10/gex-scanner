@@ -1472,6 +1472,71 @@ async function scanTickerGEX(symbol) {
     };
   });
 
+  // 6c. Put selling score — same regime logic as calls, uses support levels
+  let putScore = callScore; // Same regime — pinning is good for both
+  // Bonus: if nearest support is close below (natural floor for puts)
+  const nearestSupport = gex.topSupport && gex.topSupport[0];
+  if (nearestSupport) {
+    const pctBelow = (spotPrice - nearestSupport.strike) / spotPrice * 100;
+    if (pctBelow < 1.5) putScore = Math.min(putScore + 10, 100); // tight floor below
+    if (pctBelow > 5)   putScore = Math.max(putScore - 10, 0);   // support far away
+  }
+
+  const putScoreLabel = putScore >= 80 ? 'EXCELLENT — ideal for selling puts' :
+                        putScore >= 60 ? 'GOOD — favorable for cash-secured puts' :
+                        putScore >= 40 ? 'MARGINAL — widen strikes, reduce size' :
+                        putScore >= 20 ? 'POOR — trending regime, puts get blown through' :
+                                         'DO NOT SELL — dealers amplifying downside moves';
+  const putScoreColor = putScore >= 80 ? '#39ff14' :
+                        putScore >= 60 ? '#ffd166' :
+                        putScore >= 40 ? '#ff6b35' : '#ff2d55';
+
+  // Best put strikes to sell (GEX support levels = natural floors)
+  const putStrikes = (gex.topSupport || []).slice(0, 3).map(function(s) {
+    const pctBelow = ((spotPrice - s.strike) / spotPrice * 100).toFixed(1);
+    const gexM = Math.abs(Math.round(s.netGEX / 1e6));
+    return {
+      strike: s.strike,
+      pctBelow: parseFloat(pctBelow),
+      gexM,
+      breakeven: Math.round((s.strike - (s.strike * 0.02)) * 100) / 100, // approx 2% premium
+      recommendation: pctBelow < 1.5 ? 'AT THE FLOOR — aggressive (high premium)' :
+                      pctBelow < 3   ? 'NEAR SUPPORT — preferred strike' :
+                      pctBelow < 6   ? 'SAFE DISTANCE — conservative' : 'DEEP OTM — low premium',
+    };
+  });
+
+  // Danger zones for puts — negative GEX clusters below spot (air pockets)
+  // If price breaks into these, moves ACCELERATE downward — put gets crushed
+  const putDangerZones = (gex.topNegBands || []).filter(function(b) {
+    return b.high < spotPrice; // only danger zones BELOW spot
+  }).slice(0, 2).map(function(b) {
+    return {
+      label: b.label,
+      totalGEXB: b.totalGEXB,
+      warning: 'Air pocket ' + b.label + ' (' + b.totalGEXB + 'B) — moves accelerate here. Keep put strike ABOVE this zone.',
+    };
+  });
+
+  // Put conviction: same as call conviction but for downside protection
+  // MILD PIN + CTA long = best (market supported + pinning)
+  // TRENDING + CTA short = worst (avoid puts entirely)
+  let putConvictionLabel, putConvictionColor;
+  const ctaComp = ctaState && ctaState.composite !== null ? ctaState.composite : null;
+  if (putScore >= 75 && ctaComp !== null && ctaComp >= 25) {
+    putConvictionLabel = 'HIGH — GEX pinning + CTA long. Sell puts at GEX support.';
+    putConvictionColor = '#39ff14';
+  } else if (putScore >= 75) {
+    putConvictionLabel = 'MODERATE — GEX pinning. CTA neutral. Puts viable at support.';
+    putConvictionColor = '#ffd166';
+  } else if (putScore >= 50 && ctaComp !== null && ctaComp >= 0) {
+    putConvictionLabel = 'LOW-MODERATE — Mild regime. Size down, wider strikes only.';
+    putConvictionColor = '#ff6b35';
+  } else {
+    putConvictionLabel = 'AVOID — Trending regime. Puts get blown through. Stand aside.';
+    putConvictionColor = '#ff2d55';
+  }
+
   // 7. Score labels
   const scoreLabel = callScore >= 80 ? 'EXCELLENT — ideal for selling calls' :
                      callScore >= 60 ? 'GOOD — favorable for premium selling' :
@@ -1508,6 +1573,13 @@ async function scanTickerGEX(symbol) {
     buyScoreColor,
     callStrikes,
     callBuyLevels,
+    putScore,
+    putScoreLabel,
+    putScoreColor,
+    putStrikes,
+    putDangerZones,
+    putConvictionLabel,
+    putConvictionColor,
     conviction: tickerConviction,
     earnings: earningsData,
     topResistance: gex.topResistance,
@@ -2351,19 +2423,33 @@ ${renderCTASection()}
 <!-- TICKER GEX SCANNER -->
 <div class="card" style="margin-bottom:16px">
   <div class="card-head">
-    <span class="card-title">&#128269; Ticker GEX Scanner — Call Selling Analyzer</span>
-    <span style="font-size:11px;color:#4a6070">Scan any optionable stock for GEX regime + best call strikes to sell</span>
+    <span class="card-title">&#128269; Ticker GEX Scanner</span>
+    <span style="font-size:11px;color:#4a6070">Calls or puts — GEX regime + best strikes to sell</span>
   </div>
-  <div style="padding:16px 20px;display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
-    <div>
-      <div style="font-size:10px;color:#4a6070;letter-spacing:1px;margin-bottom:6px">TICKER SYMBOL</div>
-      <input type="text" id="ticker-input" placeholder="AAPL, TSLA, NVDA..." maxlength="6"
-        style="background:#111820;border:1px solid #1a2535;color:#d8eaf5;padding:9px 13px;font-family:'Space Mono',monospace;font-size:16px;font-weight:700;width:180px;border-radius:6px;outline:none;text-transform:uppercase"
-        onkeydown="if(event.key==='Enter')scanTicker()"
-        oninput="this.value=this.value.toUpperCase()">
+  <div style="padding:16px 20px">
+    <!-- Mode toggle -->
+    <div style="display:flex;gap:8px;margin-bottom:14px">
+      <button id="mode-calls" onclick="setMode('calls')"
+        style="flex:1;padding:8px;font-family:'Space Grotesk',sans-serif;font-size:12px;font-weight:700;letter-spacing:1px;border-radius:6px;cursor:pointer;border:1px solid #39ff14;background:#39ff1420;color:#39ff14;transition:all .15s">
+        SELL CALLS
+      </button>
+      <button id="mode-puts" onclick="setMode('puts')"
+        style="flex:1;padding:8px;font-family:'Space Grotesk',sans-serif;font-size:12px;font-weight:700;letter-spacing:1px;border-radius:6px;cursor:pointer;border:1px solid #1a2535;background:transparent;color:#4a6070;transition:all .15s">
+        SELL PUTS
+      </button>
     </div>
-    <button class="btn bp" onclick="scanTicker()" style="margin-bottom:1px">&#9654; Scan GEX</button>
-    <span id="ticker-msg" style="font-size:12px;color:#4a6070"></span>
+    <!-- Input row -->
+    <div style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
+      <div>
+        <div style="font-size:10px;color:#4a6070;letter-spacing:1px;margin-bottom:6px">TICKER SYMBOL</div>
+        <input type="text" id="ticker-input" placeholder="AAPL, TSLA, NVDA..." maxlength="6"
+          style="background:#111820;border:1px solid #1a2535;color:#d8eaf5;padding:9px 13px;font-family:'Space Mono',monospace;font-size:16px;font-weight:700;width:180px;border-radius:6px;outline:none;text-transform:uppercase"
+          onkeydown="if(event.key==='Enter')scanTicker()"
+          oninput="this.value=this.value.toUpperCase()">
+      </div>
+      <button class="btn bp" onclick="scanTicker()" style="margin-bottom:1px">&#9654; Scan GEX</button>
+      <span id="ticker-msg" style="font-size:12px;color:#4a6070"></span>
+    </div>
   </div>
   <div id="ticker-result"></div>
 </div>
@@ -2471,6 +2557,175 @@ function testPush(btn) {
     setTimeout(function() { btn.disabled = false; btn.textContent = '&#128276; Test Alert'; }, 3000);
   }).catch(function() { btn.disabled = false; btn.textContent = '&#128276; Test Alert'; });
 }
+var tickerMode = 'calls'; // 'calls' or 'puts'
+
+function setMode(mode) {
+  tickerMode = mode;
+  var callBtn = document.getElementById('mode-calls');
+  var putBtn  = document.getElementById('mode-puts');
+  if (mode === 'calls') {
+    callBtn.style.background = '#39ff1420'; callBtn.style.color = '#39ff14'; callBtn.style.borderColor = '#39ff14';
+    putBtn.style.background  = 'transparent'; putBtn.style.color = '#4a6070'; putBtn.style.borderColor = '#1a2535';
+  } else {
+    putBtn.style.background  = '#ff2d5520'; putBtn.style.color = '#ff2d55'; putBtn.style.borderColor = '#ff2d55';
+    callBtn.style.background = 'transparent'; callBtn.style.color = '#4a6070'; callBtn.style.borderColor = '#1a2535';
+  }
+  // Re-render if we have data
+  var res = document.getElementById('ticker-result');
+  if (res && res._lastData) renderTickerResult(res._lastData);
+}
+
+function renderTickerResult(d) {
+  var res = document.getElementById('ticker-result');
+  if (!res) return;
+  res._lastData = d; // cache for mode toggle re-render
+
+  var isPuts = tickerMode === 'puts';
+  var score      = isPuts ? d.putScore      : d.callScore;
+  var scoreLabel = isPuts ? d.putScoreLabel : d.scoreLabel;
+  var scoreColor = isPuts ? d.putScoreColor : d.scoreColor;
+  var scoreFill  = Math.min(score || 0, 100);
+  var scoreTitle = isPuts ? 'SELL PUTS SCORE' : 'SELL CALLS SCORE';
+
+  // Conviction block
+  var convictionHTML = '';
+  if (isPuts && d.putConvictionLabel) {
+    convictionHTML = '<div style="margin-bottom:16px;padding:12px 14px;background:' + d.putConvictionColor + '15;border-left:4px solid ' + d.putConvictionColor + ';border-radius:0 8px 8px 0">' +
+      '<div style="font-size:10px;color:#4a6070;letter-spacing:1px;margin-bottom:4px">PUT SELLING CONVICTION</div>' +
+      '<div style="font-size:12px;font-weight:700;color:' + d.putConvictionColor + '">' + d.putConvictionLabel + '</div>' +
+    '</div>';
+  } else if (!isPuts && d.conviction && d.conviction.setup !== 'NEUTRAL') {
+    convictionHTML = '<div style="margin-bottom:16px;padding:12px 14px;background:' + d.conviction.color + '15;border-left:4px solid ' + d.conviction.color + ';border-radius:0 8px 8px 0">' +
+      '<div style="font-size:10px;color:#4a6070;letter-spacing:1px;margin-bottom:4px">CONVICTION</div>' +
+      '<div style="font-size:12px;font-weight:700;color:' + d.conviction.color + '">' + d.conviction.emoji + ' ' + d.conviction.setup + ' — ' + d.conviction.tradeType + '</div>' +
+    '</div>';
+  }
+
+  // Danger zones for puts
+  var dangerHTML = '';
+  if (isPuts && d.putDangerZones && d.putDangerZones.length) {
+    dangerHTML = '<div style="margin-bottom:14px">' +
+      d.putDangerZones.map(function(z) {
+        return '<div style="padding:10px 12px;background:rgba(255,45,85,0.08);border-left:3px solid #ff2d55;border-radius:0 6px 6px 0;margin-bottom:8px">' +
+          '<div style="font-size:10px;color:#ff2d55;font-weight:700;letter-spacing:1px;margin-bottom:3px">&#9888; AIR POCKET DANGER ZONE</div>' +
+          '<div style="font-size:11px;color:#d8eaf5">' + z.warning + '</div>' +
+        '</div>';
+      }).join('') +
+    '</div>';
+  }
+
+  // Strike rows
+  var strikes = isPuts ? (d.putStrikes || []) : (d.callStrikes || []);
+  var strikeColor = isPuts ? '#ff2d55' : '#39ff14';
+  var strikeLabel = isPuts ? 'SELL PUT STRIKES — GEX SUPPORT FLOORS' : 'SELL CALL STRIKES — GEX RESISTANCE WALLS';
+  var strikeRows = strikes.map(function(s) {
+    var distLabel = isPuts ? (s.pctBelow + '% below spot') : ('+' + s.pctAway + '% from spot');
+    var gexLabel  = isPuts ? ('GEX floor: -$' + s.gexM + 'M') : ('GEX wall: +$' + s.gexM + 'M');
+    return '<div style="padding:10px 0;border-bottom:1px solid #0d1f2d">' +
+      '<div style="display:flex;align-items:center;justify-content:space-between">' +
+        '<div>' +
+          '<div class="mono" style="font-size:18px;font-weight:700;color:' + strikeColor + '">$' + s.strike + '</div>' +
+          '<div style="font-size:10px;color:#4a6070">' + distLabel + ' &nbsp;·&nbsp; ' + gexLabel + '</div>' +
+        '</div>' +
+        '<div style="font-size:10px;color:#ffd166;text-align:right;max-width:140px">' + s.recommendation + '</div>' +
+      '</div>' +
+    '</div>';
+  }).join('') || '<div style="color:#4a6070;font-size:12px">No ' + (isPuts ? 'support' : 'resistance') + ' levels found</div>';
+
+  // Buy levels (opposite side reference)
+  var buyLevels = isPuts ? (d.callStrikes || []) : (d.callBuyLevels || []);
+  var buyColor  = isPuts ? '#39ff14' : '#39ff14';
+  var buyLabel  = isPuts ? 'UPSIDE RESISTANCE (CAP RISK)' : 'BUY CALL ENTRIES';
+  var buyRows   = buyLevels.slice(0,3).map(function(s) {
+    var pct = isPuts
+      ? ('+' + ((s.strike - d.spotPrice) / d.spotPrice * 100).toFixed(1) + '% above spot')
+      : (s.pctAway + '% from spot');
+    return '<div style="padding:8px 0;border-bottom:1px solid #0d1f2d">' +
+      '<div class="mono" style="font-size:14px;font-weight:700;color:' + buyColor + '">$' + s.strike + '</div>' +
+      '<div style="font-size:10px;color:#4a6070">' + pct + '</div>' +
+    '</div>';
+  }).join('') || '<div style="color:#4a6070;font-size:11px">None in range</div>';
+
+  // Trade rules
+  var rulesHTML = isPuts
+    ? '<div style="padding:10px 12px;background:rgba(255,45,85,0.06);border-left:3px solid rgba(255,45,85,0.4);border-radius:0 6px 6px 0;font-size:10px;color:#8aa0b0;line-height:1.8">' +
+        '<div style="color:#ff2d55;font-weight:700;margin-bottom:4px">SELL PUTS RULES</div>' +
+        'Best in STRONG PIN / MILD PIN regime<br>' +
+        'Sell puts AT GEX support level<br>' +
+        'Keep strike ABOVE any air pocket zones<br>' +
+        'Stop: close below flip point<br>' +
+        'Structure: cash-secured put or put credit spread' +
+      '</div>'
+    : '<div style="padding:10px 12px;background:rgba(255,45,85,0.06);border-left:3px solid rgba(255,45,85,0.4);border-radius:0 6px 6px 0;font-size:10px;color:#8aa0b0;line-height:1.8">' +
+        '<div style="color:#ff2d55;font-weight:700;margin-bottom:4px">SELL CALLS RULES</div>' +
+        'Best in STRONG PIN / MILD PIN<br>' +
+        'Sell AT GEX resistance strike<br>' +
+        'Stop: close above flip point<br>' +
+        'Structure: credit spread or naked (if approved)' +
+      '</div>';
+
+  res.innerHTML =
+    '<div style="padding:16px 20px;border-top:1px solid #1a2535">' +
+
+      // Header
+      '<div style="display:flex;align-items:center;gap:20px;flex-wrap:wrap;margin-bottom:16px">' +
+        '<div>' +
+          '<div class="mono" style="font-size:28px;font-weight:700;color:#00d4ff">' + d.symbol + '</div>' +
+          '<div style="font-size:12px;color:#4a6070">$' + d.spotPrice + '</div>' +
+        '</div>' +
+        '<div>' +
+          '<div style="font-size:10px;color:#4a6070;letter-spacing:1px;margin-bottom:2px">REGIME</div>' +
+          '<div class="mono" style="font-size:16px;font-weight:700;color:' + d.regimeColor + '">' + d.regime + '</div>' +
+          '<div style="font-size:11px;color:#8aa0b0">' + (d.netGEXBillions >= 0 ? '+' : '') + d.netGEXBillions + 'B net GEX</div>' +
+        '</div>' +
+        '<div>' +
+          '<div style="font-size:10px;color:#4a6070;letter-spacing:1px;margin-bottom:2px">FLIP</div>' +
+          '<div class="mono" style="font-size:16px;font-weight:700;color:#ffd166">' + (d.flipPoint || 'N/A') + '</div>' +
+          '<div style="font-size:11px;color:#4a6070">regime change</div>' +
+        '</div>' +
+      '</div>' +
+
+      // Score bar
+      '<div style="margin-bottom:16px;padding:14px 16px;background:#111820;border-radius:8px;border-left:4px solid ' + scoreColor + '">' +
+        '<div style="display:flex;justify-content:space-between;margin-bottom:8px">' +
+          '<div style="font-size:10px;color:#4a6070;letter-spacing:1px">' + scoreTitle + '</div>' +
+          '<div class="mono" style="font-size:24px;font-weight:700;color:' + scoreColor + '">' + score + '<span style="font-size:12px;color:#4a6070">/100</span></div>' +
+        '</div>' +
+        '<div style="height:8px;background:#070a0f;border-radius:4px;overflow:hidden;margin-bottom:8px">' +
+          '<div style="height:100%;width:' + scoreFill + '%;background:' + scoreColor + ';border-radius:4px"></div>' +
+        '</div>' +
+        '<div style="font-size:11px;font-weight:600;color:' + scoreColor + '">' + scoreLabel + '</div>' +
+        '<div style="font-size:11px;color:#8aa0b0;margin-top:4px">' + d.regimeDesc + '</div>' +
+      '</div>' +
+
+      // Conviction
+      convictionHTML +
+
+      // Danger zones (puts only)
+      dangerHTML +
+
+      // Two columns: strikes + reference levels
+      '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:14px">' +
+        '<div>' +
+          '<div style="font-size:10px;color:' + strikeColor + ';letter-spacing:1px;margin-bottom:10px">' + strikeLabel + '</div>' +
+          strikeRows +
+        '</div>' +
+        '<div>' +
+          '<div style="font-size:10px;color:#39ff14;letter-spacing:1px;margin-bottom:10px">' + buyLabel + '</div>' +
+          buyRows +
+          '<div style="margin-top:12px">' +
+            '<div style="font-size:10px;color:#4a6070;letter-spacing:1px;margin-bottom:4px">CONTRACTS USED</div>' +
+            '<div class="mono" style="font-size:13px;color:#8aa0b0">' + (d.contractsUsed || 0) + '</div>' +
+          '</div>' +
+        '</div>' +
+      '</div>' +
+
+      // Rules
+      rulesHTML +
+
+    '</div>';
+}
+
 function scanTicker(btn) {
   var sym = document.getElementById('ticker-input').value.trim().toUpperCase();
   var msg = document.getElementById('ticker-msg');
@@ -2483,209 +2738,7 @@ function scanTicker(btn) {
   .then(function(d) {
     if (d.error) { msg.textContent = 'Error: ' + d.error; msg.style.color='#ff2d55'; return; }
     msg.textContent = 'Done — ' + d.ts; msg.style.color = '#39ff14';
-
-    // Score gauge
-    var scoreFill = Math.min(d.callScore, 100);
-    var scoreCol  = d.scoreColor || '#ffd166';
-
-    // Strike rows
-    var strikeRows = (d.callStrikes || []).map(function(s) {
-      var recCol = s.pctAway < 2 ? '#ffd166' : '#8aa0b0';
-      return '<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid #0d1f2d">' +
-        '<div>' +
-          '<div class="mono" style="font-size:18px;font-weight:700;color:#39ff14">$' + s.strike + '</div>' +
-          '<div style="font-size:10px;color:#4a6070">+' + s.pctAway + '% from spot · GEX: +$' + s.gexM + 'M</div>' +
-        '</div>' +
-        '<div style="font-size:10px;color:' + recCol + ';text-align:right;letter-spacing:1px">' + s.recommendation + '</div>' +
-      '</div>';
-    }).join('');
-
-    // Support rows (put side — for reference)
-    var supportRows = (d.topSupport || []).slice(0,3).map(function(s) {
-      var pct = ((s.strike - d.spotPrice) / d.spotPrice * 100).toFixed(1);
-      return '<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid #0d1f2d">' +
-        '<div class="mono" style="font-size:15px;font-weight:700;color:#ff2d55">$' + s.strike + '</div>' +
-        '<div style="font-size:10px;color:#4a6070">' + pct + '% · $' + Math.abs(Math.round(s.netGEX/1e6)) + 'M GEX</div>' +
-      '</div>';
-    }).join('');
-
-    res.innerHTML =
-      '<div style="padding:16px 20px;border-top:1px solid #1a2535">' +
-
-        // Header row
-        '<div style="display:flex;align-items:center;gap:20px;flex-wrap:wrap;margin-bottom:20px">' +
-          '<div>' +
-            '<div style="font-size:11px;color:#4a6070;letter-spacing:2px;margin-bottom:3px">SYMBOL</div>' +
-            '<div class="mono" style="font-size:32px;font-weight:700;color:#00d4ff">' + d.symbol + '</div>' +
-            '<div style="font-size:12px;color:#4a6070">$' + d.spotPrice + '</div>' +
-          '</div>' +
-          '<div>' +
-            '<div style="font-size:11px;color:#4a6070;letter-spacing:2px;margin-bottom:3px">REGIME</div>' +
-            '<div class="mono" style="font-size:18px;font-weight:700;color:' + d.regimeColor + '">' + d.regime + '</div>' +
-            '<div style="font-size:11px;color:#8aa0b0">' + (d.netGEXBillions >= 0 ? '+' : '') + d.netGEXBillions + 'B net GEX</div>' +
-          '</div>' +
-          '<div>' +
-            '<div style="font-size:11px;color:#4a6070;letter-spacing:2px;margin-bottom:3px">GEX FLIP</div>' +
-            '<div class="mono" style="font-size:18px;font-weight:700;color:#ffd166">' + (d.flipPoint || 'N/A') + '</div>' +
-            '<div style="font-size:11px;color:#4a6070">regime change level</div>' +
-          '</div>' +
-        '</div>' +
-
-        // Earnings warning — show first if earnings are near
-        (d.earnings && d.earnings.earningsSoon ? (
-          '<div style="margin-bottom:14px;padding:12px 14px;background:rgba(255,107,53,0.12);border:1px solid rgba(255,107,53,0.4);border-radius:8px">' +
-            '<div style="font-size:11px;font-weight:700;color:#ff6b35;letter-spacing:1px;margin-bottom:4px">&#9888; EARNINGS WARNING</div>' +
-            '<div style="font-size:11px;color:#d8eaf5">' + d.earnings.warning + '</div>' +
-            '<div style="font-size:10px;color:#4a6070;margin-top:6px">' +
-              'Near IV: ' + d.earnings.nearIV + '% (' + d.earnings.nearExpiry + ', DTE ' + d.earnings.nearDTE + ') &nbsp;·&nbsp; ' +
-              'Next IV: ' + d.earnings.nextIV + '% (' + d.earnings.nextExpiry + ') &nbsp;·&nbsp; ' +
-              'IV ratio: ' + d.earnings.ivRatio + 'x' +
-            '</div>' +
-          '</div>'
-        ) : '') +
-
-        // Conviction signal block
-        (d.conviction && d.conviction.setup !== 'NEUTRAL' ? (
-          '<div style="margin-bottom:16px;padding:14px 16px;background:' + d.conviction.color + '10;border-radius:8px;border:1px solid ' + d.conviction.color + '40">' +
-            '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">' +
-              '<div style="font-size:13px;font-weight:700;color:' + d.conviction.color + '">' + d.conviction.emoji + ' ' + d.conviction.setup + '</div>' +
-              '<div style="font-size:12px;font-weight:700;color:' + d.conviction.color + '">' + d.conviction.conviction + '% CONVICTION</div>' +
-            '</div>' +
-            '<div style="height:6px;background:#070a0f;border-radius:3px;overflow:hidden;margin-bottom:12px">' +
-              '<div style="height:100%;width:' + d.conviction.conviction + '%;background:' + d.conviction.color + ';border-radius:3px"></div>' +
-            '</div>' +
-            // CTA context row
-            '<div style="display:flex;gap:16px;margin-bottom:10px;padding:8px 10px;background:#0c1118;border-radius:6px">' +
-              '<div>' +
-                '<div style="font-size:9px;color:#4a6070;letter-spacing:1px;margin-bottom:2px">SPX CTA</div>' +
-                '<div style="font-size:11px;font-weight:700;color:' +
-                  (d.conviction.ctaStrength > 0 ? '#39ff14' : d.conviction.ctaStrength < 0 ? '#ff2d55' : '#ffd166') + '">' +
-                  (d.conviction.ctaLabel || 'N/A') +
-                '</div>' +
-              '</div>' +
-              '<div>' +
-                '<div style="font-size:9px;color:#4a6070;letter-spacing:1px;margin-bottom:2px">TICKER GEX</div>' +
-                '<div style="font-size:11px;font-weight:700;color:' + d.regimeColor + '">' + d.regime + ' (' + (d.netGEXBillions >= 0 ? '+' : '') + d.netGEXBillions + 'B)</div>' +
-              '</div>' +
-              '<div>' +
-                '<div style="font-size:9px;color:#4a6070;letter-spacing:1px;margin-bottom:2px">VS FLIP</div>' +
-                '<div style="font-size:11px;font-weight:700;color:#ffd166">' + (d.conviction.aboveFlip === true ? 'ABOVE' : d.conviction.aboveFlip === false ? 'BELOW' : 'N/A') + ' $' + (d.flipPoint || 'N/A') + '</div>' +
-              '</div>' +
-            '</div>' +
-            '<div style="font-size:12px;font-weight:700;color:' + d.conviction.color + ';margin-bottom:8px">' + d.conviction.tradeType + '</div>' +
-            '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:10px">' +
-              '<div style="padding:8px;background:#111820;border-radius:6px">' +
-                '<div style="font-size:9px;color:#4a6070;margin-bottom:3px">ENTRY</div>' +
-                '<div style="font-size:10px;color:#d8eaf5">' + d.conviction.entry + '</div>' +
-              '</div>' +
-              '<div style="padding:8px;background:#111820;border-radius:6px">' +
-                '<div style="font-size:9px;color:#39ff14;margin-bottom:3px">TARGET</div>' +
-                '<div style="font-size:10px;color:#d8eaf5">' + d.conviction.target + '</div>' +
-              '</div>' +
-              '<div style="padding:8px;background:#111820;border-radius:6px">' +
-                '<div style="font-size:9px;color:#ff2d55;margin-bottom:3px">STOP</div>' +
-                '<div style="font-size:10px;color:#d8eaf5">' + d.conviction.stop + '</div>' +
-              '</div>' +
-            '</div>' +
-            '<div style="font-size:10px;color:#00d4ff;padding:6px 10px;background:rgba(0,212,255,0.05);border-radius:4px">' +
-              '&#9654; ' + d.conviction.structure +
-            '</div>' +
-          '</div>'
-        ) : '') +
-
-        // Dual score cards
-        '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:20px">' +
-
-          // SELL calls score
-          '<div style="padding:14px 16px;background:#111820;border-radius:8px;border-left:4px solid ' + scoreCol + '">' +
-            '<div style="font-size:10px;color:#4a6070;letter-spacing:1px;margin-bottom:6px">SELL CALLS SCORE</div>' +
-            '<div class="mono" style="font-size:32px;font-weight:700;color:' + scoreCol + '">' + d.callScore + '<span style="font-size:14px;color:#4a6070">/100</span></div>' +
-            '<div style="height:6px;background:#070a0f;border-radius:3px;overflow:hidden;margin:8px 0">' +
-              '<div style="height:100%;width:' + scoreFill + '%;background:' + scoreCol + ';border-radius:3px"></div>' +
-            '</div>' +
-            '<div style="font-size:10px;font-weight:600;color:' + scoreCol + ';line-height:1.5">' + d.scoreLabel + '</div>' +
-          '</div>' +
-
-          // BUY calls score
-          '<div style="padding:14px 16px;background:#111820;border-radius:8px;border-left:4px solid ' + (d.buyScoreColor || '#ffd166') + '">' +
-            '<div style="font-size:10px;color:#4a6070;letter-spacing:1px;margin-bottom:6px">BUY PREMIUM SCORE</div>' +
-            '<div class="mono" style="font-size:32px;font-weight:700;color:' + (d.buyScoreColor || '#ffd166') + '">' + (d.buyScore || 0) + '<span style="font-size:14px;color:#4a6070">/100</span></div>' +
-            '<div style="height:6px;background:#070a0f;border-radius:3px;overflow:hidden;margin:8px 0">' +
-              '<div style="height:100%;width:' + Math.min(d.buyScore || 0, 100) + '%;background:' + (d.buyScoreColor || '#ffd166') + ';border-radius:3px"></div>' +
-            '</div>' +
-            '<div style="font-size:10px;font-weight:600;color:' + (d.buyScoreColor || '#ffd166') + ';line-height:1.5">' + (d.buyScoreLabel || '') + '</div>' +
-          '</div>' +
-
-        '</div>' +
-
-        // Regime description
-        '<div style="margin-bottom:16px;padding:10px 14px;background:#111820;border-left:3px solid ' + d.regimeColor + ';border-radius:0 6px 6px 0;font-size:12px;color:#8aa0b0">' +
-          d.regimeDesc +
-        '</div>' +
-
-        // Three columns: sell strikes | buy levels | support
-        '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:16px">' +
-
-          // Sell call strikes
-          '<div>' +
-            '<div style="font-size:10px;color:#ff2d55;letter-spacing:1px;margin-bottom:10px">&#9660; SELL CALL STRIKES</div>' +
-            (strikeRows || '<div style="color:#4a6070;font-size:11px">No resistance found</div>') +
-          '</div>' +
-
-          // Buy call levels (support = dip entry for longs)
-          '<div>' +
-            '<div style="font-size:10px;color:#39ff14;letter-spacing:1px;margin-bottom:10px">&#9650; BUY CALL ENTRIES</div>' +
-            (function() {
-              return (d.callBuyLevels || []).map(function(s) {
-                var recCol = Math.abs(s.pctAway) < 2 ? '#ffd166' : '#8aa0b0';
-                return '<div style="padding:10px 0;border-bottom:1px solid #0d1f2d">' +
-                  '<div class="mono" style="font-size:16px;font-weight:700;color:#39ff14">$' + s.strike + '</div>' +
-                  '<div style="font-size:10px;color:#4a6070">' + s.pctAway + '% · $' + s.gexM + 'M GEX</div>' +
-                  '<div style="font-size:9px;color:' + recCol + ';margin-top:2px">' + s.recommendation + '</div>' +
-                '</div>';
-              }).join('') || '<div style="color:#4a6070;font-size:11px">No support found</div>';
-            })() +
-          '</div>' +
-
-          // Flip point context
-          '<div>' +
-            '<div style="font-size:10px;color:#ffd166;letter-spacing:1px;margin-bottom:10px">&#9646; KEY LEVELS</div>' +
-            '<div style="padding:10px 0;border-bottom:1px solid #0d1f2d">' +
-              '<div style="font-size:10px;color:#4a6070;margin-bottom:2px">GEX FLIP</div>' +
-              '<div class="mono" style="font-size:16px;font-weight:700;color:#ffd166">' + (d.flipPoint || 'N/A') + '</div>' +
-              '<div style="font-size:9px;color:#4a6070">regime change level</div>' +
-            '</div>' +
-            '<div style="padding:10px 0;border-bottom:1px solid #0d1f2d">' +
-              '<div style="font-size:10px;color:#4a6070;margin-bottom:2px">NET GEX</div>' +
-              '<div class="mono" style="font-size:16px;font-weight:700;color:' + d.regimeColor + '">' + (d.netGEXBillions >= 0 ? '+' : '') + d.netGEXBillions + 'B</div>' +
-            '</div>' +
-            '<div style="padding:10px 0">' +
-              '<div style="font-size:10px;color:#4a6070;margin-bottom:2px">CONTRACTS</div>' +
-              '<div class="mono" style="font-size:13px;color:#8aa0b0">' + (d.contractsUsed || 0) + ' used</div>' +
-            '</div>' +
-          '</div>' +
-
-        '</div>' +
-
-        // Trade rules — both playbooks
-        '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">' +
-          '<div style="padding:10px 12px;background:rgba(255,45,85,0.06);border-left:3px solid rgba(255,45,85,0.4);border-radius:0 6px 6px 0;font-size:10px;color:#8aa0b0;line-height:1.8">' +
-            '<div style="color:#ff2d55;font-weight:700;margin-bottom:4px">SELL CALLS RULES</div>' +
-            'Best in STRONG PIN / MILD PIN<br>' +
-            'Sell AT GEX resistance strike<br>' +
-            'Stop: close above flip point<br>' +
-            'Structure: credit spread or naked (if approved)' +
-          '</div>' +
-          '<div style="padding:10px 12px;background:rgba(57,255,20,0.06);border-left:3px solid rgba(57,255,20,0.4);border-radius:0 6px 6px 0;font-size:10px;color:#8aa0b0;line-height:1.8">' +
-            '<div style="color:#39ff14;font-weight:700;margin-bottom:4px">BUY CALLS RULES</div>' +
-            'Best in TRENDING (negative GEX)<br>' +
-            'Buy at GEX support / dip entry<br>' +
-            'Target: next GEX resistance above<br>' +
-            'Structure: debit spread or long call' +
-          '</div>' +
-        '</div>' +
-
-      '</div>';
+    renderTickerResult(d);
   })
   .catch(function(e) { msg.textContent = 'Failed: ' + e.message; msg.style.color='#ff2d55'; });
 }
