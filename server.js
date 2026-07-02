@@ -57,6 +57,22 @@ let gexRunning = false;
 let gexLastRun = null;
 
 async function fetchSpot(symbol) {
+  // Retry helper for transient connection drops
+  async function fetchWithRetry(url, opts, retries) {
+    for (var attempt = 0; attempt <= retries; attempt++) {
+      try {
+        var r = await fetch(url, opts);
+        return r;
+      } catch(e) {
+        if (attempt < retries && (e.message.includes('Premature') || e.message.includes('Invalid response') || e.name === 'AbortError')) {
+          log('warn', 'Retry ' + (attempt+1) + ' for ' + url.slice(0,60));
+          await new Promise(function(r) { setTimeout(r, 800 * (attempt + 1)); });
+          continue;
+        }
+        throw e;
+      }
+    }
+  }
   try {
     if (symbol === 'SPX') {
       // SPX index is not available on Alpaca IEX feed — derive from SPY*10
@@ -1015,18 +1031,37 @@ async function fetchCTABars(symbol, days) {
     '&adjustment=raw' +
     '&feed=iex';
 
-  const res = await fetch(url, {
-    headers: {
-      'APCA-API-KEY-ID':     alpacaKey,
-      'APCA-API-SECRET-KEY': alpacaSecret,
-      'Accept': 'application/json',
-    },
-  });
+  // Timeout controller — 10s max per symbol to prevent premature close cascade
+  const ctrl    = new AbortController();
+  const timeout = setTimeout(function() { ctrl.abort(); }, 10000);
+
+  let res;
+  try {
+    res = await fetch(url, {
+      signal: ctrl.signal,
+      headers: {
+        'APCA-API-KEY-ID':     alpacaKey,
+        'APCA-API-SECRET-KEY': alpacaSecret,
+        'Accept': 'application/json',
+      },
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+
   if (!res.ok) {
     const errText = await res.text().catch(function() { return ''; });
     throw new Error('Alpaca ' + symbol + ' HTTP ' + res.status + ': ' + errText.slice(0, 120));
   }
-  const json = await res.json();
+
+  // Guard against premature close / invalid body
+  let json;
+  try {
+    json = await res.json();
+  } catch(parseErr) {
+    throw new Error('Alpaca ' + symbol + ' parse error (premature close?): ' + parseErr.message);
+  }
+
   const bars = json && json.bars;
   if (!bars || !Array.isArray(bars) || bars.length === 0) throw new Error('No history for ' + symbol);
 
@@ -1092,7 +1127,15 @@ async function refreshCTA() {
   try {
     for (const asset of CTA_UNIVERSE) {
       try {
-        const bars = await fetchCTABars(asset.symbol, 250);
+        // Retry once on failure (handles transient Alpaca connection drops)
+        let bars;
+        try {
+          bars = await fetchCTABars(asset.symbol, 250);
+        } catch(fetchErr) {
+          log('warn', 'CTA ' + asset.symbol + ' retry after: ' + fetchErr.message);
+          await new Promise(function(r) { setTimeout(r, 1500); });
+          bars = await fetchCTABars(asset.symbol, 250);
+        }
         const pos = ctaCalculatePositioning(bars);
         if (pos.position === null) { errors.push(asset.symbol + ': ' + pos.error); continue; }
         assets.push({
@@ -1105,7 +1148,7 @@ async function refreshCTA() {
         weightedPosition += pos.position * asset.weight;
         totalWeight += asset.weight;
         if (asset.symbol === 'SPY') spyTriggers = ctaCalculateTriggers(bars, pos.currentPrice);
-        await new Promise(function(r) { setTimeout(r, 250); });
+        await new Promise(function(r) { setTimeout(r, 600); }); // 600ms between fetches to avoid rate limits
       } catch(e) { errors.push(asset.symbol + ': ' + e.message); log('warn', 'CTA ' + asset.symbol + ': ' + e.message); }
     }
     const composite = totalWeight > 0 ? Math.round((weightedPosition / totalWeight) * 100 * 10) / 10 : null;
@@ -1362,9 +1405,22 @@ async function scanTickerGEX(symbol) {
   log('info', '== Ticker GEX scan: ' + symbol + ' ==');
 
   // 1. Get spot price
-  const spotRes = await fetch('https://api.tradier.com/v1/markets/quotes?symbols=' + symbol,
-    { headers: { 'Authorization': 'Bearer ' + CONFIG.tradierToken, 'Accept': 'application/json' } });
-  if (!spotRes.ok) throw new Error('Quote fetch failed: HTTP ' + spotRes.status);
+  // Retry up to 2 times on connection drops
+  let spotRes;
+  for (let _attempt = 0; _attempt < 3; _attempt++) {
+    try {
+      spotRes = await fetch('https://api.tradier.com/v1/markets/quotes?symbols=' + symbol,
+        { headers: { 'Authorization': 'Bearer ' + CONFIG.tradierToken, 'Accept': 'application/json' } });
+      break;
+    } catch(e) {
+      if (_attempt < 2 && (e.message.includes('Premature') || e.message.includes('Invalid response'))) {
+        await new Promise(function(r) { setTimeout(r, 1000 * (_attempt + 1)); });
+        continue;
+      }
+      throw e;
+    }
+  }
+  if (!spotRes || !spotRes.ok) throw new Error('Quote fetch failed: HTTP ' + (spotRes ? spotRes.status : 'no response'));
   const spotJson = await spotRes.json();
   const q = spotJson.quotes && spotJson.quotes.quote;
   const spotPrice = q && q.last ? parseFloat(q.last) : null;
