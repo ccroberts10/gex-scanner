@@ -1902,13 +1902,218 @@ function buildTickerConviction(tickerGEX, ctaState) {
   return { setup, direction, conviction, tradeType, entry, target, stop, structure, color, emoji, netGEX, flipPoint, aboveFlip, spot, ctaLabel, ctaStrength, composite };
 }
 
+
+// ─── MARKET HEALTH MODULE ─────────────────────────────────────────────────────
+// Weekly macro sentiment dashboard using automatable signals:
+//   VIX, P/C ratio, CTA composite, HYG/LQD credit spread proxy,
+//   TLT trend (rates), SPY 50d momentum
+// Outputs: Overheated / Constructive / Caution / Dangerous
+
+let marketHealthState = null;
+let marketHealthLastRun = null;
+
+async function fetchMarketHealth() {
+  log('info', '== Market Health scan starting ==');
+  const alpacaKey    = (process.env.ALPACA_KEY    || process.env.APCA_API_KEY_ID     || '').trim();
+  const alpacaSecret = (process.env.ALPACA_SECRET || process.env.APCA_API_SECRET_KEY || '').trim();
+  const signals = [];
+  let bullCount = 0, bearCount = 0, neutralCount = 0;
+
+  // Helper: fetch Alpaca daily bars
+  async function getAlpacaBars(symbol, days) {
+    const end   = new Date(); end.setMinutes(end.getMinutes() - 20);
+    const start = new Date(); start.setDate(start.getDate() - Math.ceil(days * 1.6));
+    const url   = 'https://data.alpaca.markets/v2/stocks/' + encodeURIComponent(symbol) + '/bars' +
+      '?start=' + encodeURIComponent(start.toISOString()) +
+      '&end='   + encodeURIComponent(end.toISOString()) +
+      '&timeframe=1Day&limit=400&adjustment=raw&feed=iex';
+    const ctrl = new AbortController();
+    const tid  = setTimeout(function() { ctrl.abort(); }, 8000);
+    try {
+      const res  = await fetch(url, { signal: ctrl.signal, headers: { 'APCA-API-KEY-ID': alpacaKey, 'APCA-API-SECRET-KEY': alpacaSecret } });
+      clearTimeout(tid);
+      if (!res.ok) return null;
+      const json = await res.json();
+      return (json && json.bars) || null;
+    } catch(e) { clearTimeout(tid); return null; }
+  }
+
+  function sma(bars, period) {
+    if (!bars || bars.length < period) return null;
+    var sum = 0;
+    for (var i = bars.length - period; i < bars.length; i++) sum += bars[i].c;
+    return sum / period;
+  }
+
+  // ── Signal 1: VIX regime ─────────────────────────────────────────────────
+  try {
+    const vixRes = await fetch('https://api.tradier.com/v1/markets/quotes?symbols=VIX',
+      { headers: { 'Authorization': 'Bearer ' + CONFIG.tradierToken, 'Accept': 'application/json' } });
+    if (vixRes.ok) {
+      const vixJson = await vixRes.json();
+      const vix = parseFloat(vixJson.quotes && vixJson.quotes.quote && vixJson.quotes.quote.last);
+      if (!isNaN(vix)) {
+        const bull = vix < 18;
+        const bear = vix > 25;
+        signals.push({
+          name: 'VIX', value: vix.toFixed(1),
+          status: bull ? 'bull' : bear ? 'bear' : 'neutral',
+          label: bull ? 'Low fear — market calm' : bear ? 'Elevated fear — caution' : 'Normal range',
+          icon: bull ? '✓' : bear ? '⚠' : '~',
+        });
+        if (bull) bullCount++; else if (bear) bearCount++; else neutralCount++;
+      }
+    }
+  } catch(e) { log('warn', 'MarketHealth VIX: ' + e.message); }
+
+  // ── Signal 2: P/C Ratio ───────────────────────────────────────────────────
+  // Already computed in marketContext — use gexData if available
+  if (gexData && gexData.marketContext && gexData.marketContext.pcRatio != null) {
+    const pc = gexData.marketContext.pcRatio;
+    const bull = pc > 1.1;  // elevated puts = contrarian bullish
+    const bear = pc < 0.7;  // call mania = contrarian bearish
+    signals.push({
+      name: 'P/C Ratio', value: pc.toFixed(2),
+      status: bull ? 'bull' : bear ? 'bear' : 'neutral',
+      label: bull ? 'Elevated puts — contrarian bullish signal' : bear ? 'Call mania — retail overconfident' : 'Neutral positioning',
+      icon: bull ? '✓' : bear ? '⚠' : '~',
+    });
+    if (bull) bullCount++; else if (bear) bearCount++; else neutralCount++;
+  }
+
+  // ── Signal 3: CTA Composite ───────────────────────────────────────────────
+  if (ctaState && ctaState.composite !== null) {
+    const c = ctaState.composite;
+    const bull = c >= 25 && c < 75;   // long but not crowded
+    const crowded = c >= 75;           // crowded long = risk
+    const bear = c <= -25;
+    signals.push({
+      name: 'CTA Positioning', value: (c > 0 ? '+' : '') + c,
+      status: crowded ? 'bear' : bull ? 'bull' : bear ? 'bear' : 'neutral',
+      label: crowded ? 'Crowded long — mechanical unwind risk' :
+             bull    ? 'Net long — trend followers supportive' :
+             bear    ? 'Net short — trend followers pressuring' : 'Neutral positioning',
+      icon: crowded ? '⚠' : bull ? '✓' : bear ? '⚠' : '~',
+    });
+    if (crowded || bear) bearCount++; else if (bull) bullCount++; else neutralCount++;
+  }
+
+  if (alpacaKey) {
+    // ── Signal 4: Credit Health (HYG/LQD ratio) ───────────────────────────
+    // Rising HYG/LQD = credit spreads tightening = risk-on = bullish
+    try {
+      const [hygBars, lqdBars] = await Promise.all([getAlpacaBars('HYG', 30), getAlpacaBars('LQD', 30)]);
+      if (hygBars && lqdBars && hygBars.length >= 20 && lqdBars.length >= 20) {
+        const ratioNow  = hygBars[hygBars.length-1].c / lqdBars[lqdBars.length-1].c;
+        const ratio20d  = (function() {
+          var h = hygBars.slice(-20).reduce(function(s,b) { return s+b.c; }, 0) / 20;
+          var l = lqdBars.slice(-20).reduce(function(s,b) { return s+b.c; }, 0) / 20;
+          return h / l;
+        })();
+        const trend = ((ratioNow - ratio20d) / ratio20d * 100).toFixed(2);
+        const bull  = parseFloat(trend) > 0.3;
+        const bear  = parseFloat(trend) < -0.3;
+        signals.push({
+          name: 'Credit (HYG/LQD)', value: (trend > 0 ? '+' : '') + trend + '%',
+          status: bull ? 'bull' : bear ? 'bear' : 'neutral',
+          label: bull ? 'Credit spreads tightening — risk-on' : bear ? 'Credit spreads widening — stress signal' : 'Credit stable',
+          icon: bull ? '✓' : bear ? '⚠' : '~',
+        });
+        if (bull) bullCount++; else if (bear) bearCount++; else neutralCount++;
+      }
+    } catch(e) { log('warn', 'MarketHealth HYG/LQD: ' + e.message); }
+
+    // ── Signal 5: Rates / Liquidity (TLT 20d trend) ───────────────────────
+    // TLT rising = rates falling = liquidity loosening = bullish for equities
+    try {
+      const tltBars = await getAlpacaBars('TLT', 40);
+      if (tltBars && tltBars.length >= 20) {
+        const tltNow  = tltBars[tltBars.length-1].c;
+        const tlt20d  = tltBars.slice(-20).reduce(function(s,b) { return s+b.c; }, 0) / 20;
+        const tltTrend = ((tltNow - tlt20d) / tlt20d * 100).toFixed(2);
+        const bull = parseFloat(tltTrend) > 1;
+        const bear = parseFloat(tltTrend) < -1;
+        signals.push({
+          name: 'Rates (TLT trend)', value: (tltTrend > 0 ? '+' : '') + tltTrend + '%',
+          status: bull ? 'bull' : bear ? 'bear' : 'neutral',
+          label: bull ? 'Bonds rising — rates falling, liquidity loosening' : bear ? 'Bonds falling — rates rising, headwind for equities' : 'Rates stable',
+          icon: bull ? '✓' : bear ? '⚠' : '~',
+        });
+        if (bull) bullCount++; else if (bear) bearCount++; else neutralCount++;
+      }
+    } catch(e) { log('warn', 'MarketHealth TLT: ' + e.message); }
+
+    // ── Signal 6: SPY Momentum (price vs 50d SMA) ─────────────────────────
+    try {
+      const spyBars = await getAlpacaBars('SPY', 70);
+      if (spyBars && spyBars.length >= 50) {
+        const spyNow  = spyBars[spyBars.length-1].c;
+        const spy50d  = sma(spyBars, 50);
+        const pctFrom50 = spy50d ? ((spyNow - spy50d) / spy50d * 100).toFixed(1) : null;
+        if (pctFrom50 !== null) {
+          const bull = parseFloat(pctFrom50) > 2;
+          const bear = parseFloat(pctFrom50) < -2;
+          const overheated = parseFloat(pctFrom50) > 8; // too far above 50d
+          signals.push({
+            name: 'SPY vs 50d SMA', value: (pctFrom50 > 0 ? '+' : '') + pctFrom50 + '%',
+            status: overheated ? 'bear' : bull ? 'bull' : bear ? 'bear' : 'neutral',
+            label: overheated ? 'Overextended above 50d — pullback risk' : bull ? 'Healthy uptrend above 50d' : bear ? 'Below 50d — trend broken' : 'Near 50d — neutral',
+            icon: overheated ? '⚠' : bull ? '✓' : bear ? '⚠' : '~',
+          });
+          if (overheated || bear) bearCount++; else if (bull) bullCount++; else neutralCount++;
+        }
+      }
+    } catch(e) { log('warn', 'MarketHealth SPY: ' + e.message); }
+  }
+
+  // ── Overall Rating ────────────────────────────────────────────────────────
+  const total = bullCount + bearCount + neutralCount;
+  const bullPct = total > 0 ? bullCount / total : 0;
+  const bearPct = total > 0 ? bearCount / total : 0;
+
+  let rating, ratingColor, ratingEmoji, ratingDesc, action;
+  if (bearPct >= 0.5) {
+    rating = 'DANGEROUS'; ratingColor = '#ff2d55'; ratingEmoji = '🔴';
+    ratingDesc = 'Multiple risk signals flashing. Reduce exposure, hedge, stand aside.';
+    action = 'Reduce exposure. Hedges warranted.';
+  } else if (bearPct >= 0.33 && bullPct < 0.5) {
+    rating = 'CAUTION'; ratingColor = '#ff6b35'; ratingEmoji = '🟠';
+    ratingDesc = 'Mixed signals. Risk elevated but not extreme. Size down, be selective.';
+    action = 'Size down. Be selective. Wait for cleaner setups.';
+  } else if (bullPct >= 0.6) {
+    rating = 'CONSTRUCTIVE'; ratingColor = '#39ff14'; ratingEmoji = '🟢';
+    ratingDesc = 'Conditions favorable. Start building positions in quality names.';
+    action = 'Build positions. Focus on beaten-down quality names.';
+  } else if (bullPct >= 0.5 && bearPct < 0.2) {
+    rating = 'MILD BULL'; ratingColor = '#ffd166'; ratingEmoji = '🟡';
+    ratingDesc = 'More bull signals than bear. Lean long but stay nimble.';
+    action = 'Lean long. Maintain stops. Watch for deterioration.';
+  } else {
+    rating = 'NEUTRAL'; ratingColor = '#4a6070'; ratingEmoji = '⚪';
+    ratingDesc = 'No clear edge. Discretionary flow dominates. Trade GEX levels.';
+    action = 'No macro edge. Trade structure and GEX levels only.';
+  }
+
+  marketHealthState = {
+    ts: new Date().toLocaleString('en-US', { timeZone: 'America/Denver', hour12: true }),
+    rating, ratingColor, ratingEmoji, ratingDesc, action,
+    bullCount, bearCount, neutralCount,
+    signals,
+  };
+  marketHealthLastRun = new Date().toISOString();
+  log('ok', '== Market Health: ' + rating + ' (' + bullCount + ' bull / ' + bearCount + ' bear / ' + neutralCount + ' neutral) ==');
+  return marketHealthState;
+}
+
 // ─── SCHEDULER ────────────────────────────────────────────────────────────────
 function startScheduler() {
   // 8:00am MST = 15:00 UTC (MDT)
   cron.schedule('0 15 * * 1-5', function() { runGEXScan('8:00am MST'); });
   // 9:30am MST = 16:30 UTC
   cron.schedule('30 16 * * 1-5', function() { runGEXScan('9:30am MST'); });
-  log('info', 'GEX scheduler started — 8:00am + 9:30am MST weekdays');
+  // Market Health — every Monday 7:45am MST (before GEX scan)
+  cron.schedule('45 14 * * 1', function() { fetchMarketHealth().catch(function(e) { log('warn', 'MarketHealth: ' + e.message); }); });
+  log('info', 'GEX scheduler started — 8:00am + 9:30am MST weekdays | Market Health: Mondays 7:45am');
 }
 
 // ─── HTML DASHBOARD ───────────────────────────────────────────────────────────
@@ -2014,6 +2219,66 @@ ${d ? `
     </div>
   </div>
 </div>
+
+${marketHealthState ? `
+<!-- MARKET HEALTH DASHBOARD -->
+<div class="card" style="margin-bottom:16px;border-color:${marketHealthState.ratingColor}40">
+  <div class="card-head" style="background:${marketHealthState.ratingColor}10">
+    <span class="card-title" style="color:${marketHealthState.ratingColor}">${marketHealthState.ratingEmoji} MARKET HEALTH — ${marketHealthState.rating}</span>
+    <div style="display:flex;align-items:center;gap:8px">
+      <span style="font-size:11px;color:#4a6070">${marketHealthState.ts}</span>
+      <button class="btn bs" style="padding:4px 10px;font-size:10px" onclick="refreshHealth(this)">&#8635;</button>
+    </div>
+  </div>
+  <div style="padding:16px 20px">
+
+    <!-- Rating bar -->
+    <div style="display:flex;align-items:center;gap:16px;margin-bottom:16px;flex-wrap:wrap">
+      <div>
+        <div style="font-size:28px;font-weight:700;color:${marketHealthState.ratingColor}">${marketHealthState.rating}</div>
+        <div style="font-size:11px;color:#8aa0b0;margin-top:3px">${marketHealthState.ratingDesc}</div>
+      </div>
+      <div style="margin-left:auto;text-align:right">
+        <div style="font-size:10px;color:#4a6070;margin-bottom:4px">SIGNAL BREAKDOWN</div>
+        <div style="display:flex;gap:10px">
+          <div style="text-align:center"><div class="mono" style="font-size:18px;color:#39ff14">${marketHealthState.bullCount}</div><div style="font-size:9px;color:#39ff14">BULL</div></div>
+          <div style="text-align:center"><div class="mono" style="font-size:18px;color:#ff2d55">${marketHealthState.bearCount}</div><div style="font-size:9px;color:#ff2d55">BEAR</div></div>
+          <div style="text-align:center"><div class="mono" style="font-size:18px;color:#4a6070">${marketHealthState.neutralCount}</div><div style="font-size:9px;color:#4a6070">NEUT</div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Signal checklist -->
+    <div style="margin-bottom:14px">
+      ${(marketHealthState.signals || []).map(function(s) {
+        var col = s.status === 'bull' ? '#39ff14' : s.status === 'bear' ? '#ff2d55' : '#4a6070';
+        var bg  = s.status === 'bull' ? 'rgba(57,255,20,0.06)' : s.status === 'bear' ? 'rgba(255,45,85,0.06)' : 'rgba(255,255,255,0.02)';
+        return '<div style="display:flex;align-items:center;gap:12px;padding:8px 10px;background:' + bg + ';border-radius:6px;margin-bottom:6px">' +
+          '<div style="font-size:14px;width:20px;text-align:center;color:' + col + ';font-weight:700">' + s.icon + '</div>' +
+          '<div style="flex:1">' +
+            '<div style="font-size:12px;font-weight:600;color:' + col + '">' + s.name + ' <span style="color:#4a6070;font-weight:400;font-size:11px">(' + s.value + ')</span></div>' +
+            '<div style="font-size:10px;color:#8aa0b0">' + s.label + '</div>' +
+          '</div>' +
+        '</div>';
+      }).join('')}
+    </div>
+
+    <!-- Action -->
+    <div style="padding:10px 14px;background:${marketHealthState.ratingColor}15;border-left:3px solid ${marketHealthState.ratingColor};border-radius:0 6px 6px 0;font-size:12px;font-weight:600;color:${marketHealthState.ratingColor}">
+      &#9654; ${marketHealthState.action}
+    </div>
+  </div>
+</div>
+` : `
+<!-- MARKET HEALTH LOADING -->
+<div class="card" style="margin-bottom:16px">
+  <div class="card-head">
+    <span class="card-title">&#127973; Market Health Dashboard</span>
+    <button class="btn bs" style="padding:4px 10px;font-size:10px" onclick="refreshHealth(this)">&#9654; Run Now</button>
+  </div>
+  <div style="padding:30px;text-align:center;color:#4a6070;font-size:12px">Loading market health signals... auto-runs on startup and Mondays 7:45am MST</div>
+</div>
+`}
 
 ${(d.marketContext && d.marketContext.fomcToday) ? `
 <!-- FOMC BANNER -->
@@ -2799,6 +3064,13 @@ function scanTicker(btn) {
   .catch(function(e) { msg.textContent = 'Failed: ' + e.message; msg.style.color='#ff2d55'; });
 }
 
+function refreshHealth(btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Running...'; }
+  fetch('/api/health/refresh', { method: 'POST' }).then(function() {
+    setTimeout(function() { location.reload(); }, 8000);
+  }).catch(function() { if (btn) { btn.disabled = false; btn.textContent = '\u21BB'; } });
+}
+
 function refreshCTA(btn) {
   if (btn) { btn.disabled = true; btn.textContent = 'Refreshing...'; }
   fetch('/api/cta/refresh', { method: 'POST' }).then(function() {
@@ -2820,6 +3092,18 @@ setTimeout(function() { location.reload(); }, 300000);
 // ─── HTTP SERVER ──────────────────────────────────────────────────────────────
 http.createServer(async function(req, res) {
   const url = req.url.split('?')[0];
+
+  if (req.method === 'GET' && url === '/api/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify(marketHealthState || { loading: true }));
+    return;
+  }
+  if (req.method === 'POST' && url === '/api/health/refresh') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+    fetchMarketHealth().catch(function(e) { log('warn', 'MarketHealth refresh: ' + e.message); });
+    return;
+  }
 
   if (req.method === 'GET' && url === '/api/cta') {
     res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
@@ -2945,3 +3229,5 @@ startScheduler();
 setTimeout(function() { runGEXScan('Startup'); }, 5000);
 // Start CTA polling 10s after startup
 startCTAPolling();
+// Run market health 20s after startup
+setTimeout(function() { fetchMarketHealth().catch(function(e) { log('warn', 'MarketHealth startup: ' + e.message); }); }, 20000);
