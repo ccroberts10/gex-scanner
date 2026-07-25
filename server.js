@@ -2064,6 +2064,100 @@ async function fetchMarketHealth() {
         }
       }
     } catch(e) { log('warn', 'MarketHealth SPY: ' + e.message); }
+
+    // ── Signal 7: Correlation Proxy (COR1M approximation) ────────────────────
+    // Method: VIX^2 / weighted avg(individual stock IV^2)
+    // High ratio = high correlation (macro dominates, avoid individual names)
+    // Low ratio  = low correlation = stock picker's market (trust individual GEX signals)
+    try {
+      const corrTickers = ['SPY', 'QQQ', 'NVDA', 'AAPL', 'MSFT', 'META', 'AMZN', 'GOOGL'];
+      const ivSamples = [];
+
+      if (CONFIG.tradierToken && gexData && gexData.marketContext && gexData.marketContext.vix) {
+        const vix = gexData.marketContext.vix;
+
+        // Fetch ATM IV for each ticker from Tradier (use nearest expiry)
+        for (var ci = 0; ci < corrTickers.length; ci++) {
+          var sym = corrTickers[ci];
+          try {
+            // Get spot price first
+            var qRes = await fetch('https://api.tradier.com/v1/markets/quotes?symbols=' + sym,
+              { headers: { 'Authorization': 'Bearer ' + CONFIG.tradierToken, 'Accept': 'application/json' } });
+            if (!qRes.ok) continue;
+            var qJson = await qRes.json();
+            var spot = parseFloat(qJson.quotes && qJson.quotes.quote && qJson.quotes.quote.last);
+            if (!spot || isNaN(spot)) continue;
+
+            // Get nearest expiry chain
+            var expRes = await fetch('https://api.tradier.com/v1/markets/options/expirations?symbol=' + sym,
+              { headers: { 'Authorization': 'Bearer ' + CONFIG.tradierToken, 'Accept': 'application/json' } });
+            if (!expRes.ok) continue;
+            var expJson = await expRes.json();
+            var exps = expJson.expirations && expJson.expirations.date;
+            if (!exps) continue;
+            var nearExp = Array.isArray(exps) ? exps[0] : exps;
+
+            var chainRes = await fetch(
+              'https://api.tradier.com/v1/markets/options/chains?symbol=' + sym + '&expiration=' + nearExp + '&greeks=false',
+              { headers: { 'Authorization': 'Bearer ' + CONFIG.tradierToken, 'Accept': 'application/json' } }
+            );
+            if (!chainRes.ok) continue;
+            var chainJson = await chainRes.json();
+            var opts = (chainJson.options && chainJson.options.option) || [];
+
+            // Find ATM options and get their IV
+            var atmOpts = opts.filter(function(o) {
+              return o.greeks && o.greeks.mid_iv && o.greeks.mid_iv > 0 &&
+                     Math.abs(o.strike - spot) / spot < 0.03;
+            });
+            if (!atmOpts.length) {
+              // Fallback: use any options with IV
+              atmOpts = opts.filter(function(o) { return o.greeks && o.greeks.mid_iv > 0; });
+            }
+            if (atmOpts.length) {
+              var avgIV = atmOpts.reduce(function(s, o) { return s + o.greeks.mid_iv; }, 0) / atmOpts.length;
+              ivSamples.push({ symbol: sym, iv: avgIV * 100 }); // convert to percentage
+            }
+            await new Promise(function(r) { setTimeout(r, 200); });
+          } catch(e2) { /* skip this ticker */ }
+        }
+
+        if (ivSamples.length >= 3) {
+          // Weighted avg IV^2 (equal weight for simplicity)
+          var avgStockIV = ivSamples.reduce(function(s, x) { return s + x.iv; }, 0) / ivSamples.length;
+          // COR1M proxy: ratio of index vol to stock vol, normalized 0-100
+          // Low = decorrelated, High = highly correlated
+          var corProxy = Math.min(Math.round((vix / avgStockIV) * 50), 100);
+
+          var corBull  = corProxy < 40;   // low correlation = stock picker's market
+          var corBear  = corProxy > 70;   // high correlation = macro dominates
+          var corLabel, corDesc;
+
+          if (corProxy < 25) {
+            corLabel = 'VERY LOW'; corDesc = 'Extreme dispersion — pure stock pickers market. Individual GEX signals highly reliable.';
+          } else if (corProxy < 40) {
+            corLabel = 'LOW'; corDesc = 'Low correlation — stock selection matters. Trust individual ticker GEX scans.';
+          } else if (corProxy < 60) {
+            corLabel = 'MODERATE'; corDesc = 'Mixed — some macro influence. Use both SPX GEX and individual signals.';
+          } else if (corProxy < 75) {
+            corLabel = 'ELEVATED'; corDesc = 'High correlation — macro driving everything. Favor SPY/QQQ over individual names.';
+          } else {
+            corLabel = 'EXTREME'; corDesc = 'Stocks moving in lockstep — avoid individual name GEX, trade SPX only.';
+          }
+
+          signals.push({
+            name: 'Correlation (COR1M~)',
+            value: corProxy + ' (' + corLabel + ')',
+            status: corBull ? 'bull' : corBear ? 'bear' : 'neutral',
+            label: corDesc,
+            icon: corBull ? '✓' : corBear ? '⚠' : '~',
+            extra: 'VIX: ' + vix.toFixed(1) + ' | Avg stock IV: ' + avgStockIV.toFixed(1) + '% | Tickers sampled: ' + ivSamples.length,
+          });
+          if (corBull) bullCount++; else if (corBear) bearCount++; else neutralCount++;
+          log('info', 'Correlation proxy: ' + corProxy + ' (' + corLabel + ') | Avg stock IV: ' + avgStockIV.toFixed(1) + '%');
+        }
+      }
+    } catch(e) { log('warn', 'MarketHealth Correlation: ' + e.message); }
   }
 
   // ── Overall Rating ────────────────────────────────────────────────────────
@@ -2094,15 +2188,287 @@ async function fetchMarketHealth() {
     action = 'No macro edge. Trade structure and GEX levels only.';
   }
 
+  // Extract correlation signal for special display
+  const corrSignal = signals.find(function(s) { return s.name.includes('Correlation'); });
+
   marketHealthState = {
     ts: new Date().toLocaleString('en-US', { timeZone: 'America/Denver', hour12: true }),
     rating, ratingColor, ratingEmoji, ratingDesc, action,
     bullCount, bearCount, neutralCount,
     signals,
+    corrProxy: corrSignal ? corrSignal.value : null,
+    corrStatus: corrSignal ? corrSignal.status : null,
+    corrDesc: corrSignal ? corrSignal.label : null,
   };
   marketHealthLastRun = new Date().toISOString();
   log('ok', '== Market Health: ' + rating + ' (' + bullCount + ' bull / ' + bearCount + ' bear / ' + neutralCount + ' neutral) ==');
   return marketHealthState;
+}
+
+
+// ─── WEEKLY BIAS MODULE ──────────────────────────────────────────────────────
+// Runs every Monday morning. Combines:
+//   SPX technical structure (weekly MAs), GEX flip context,
+//   CTA trend direction, VIX/credit/correlation from market health
+// Outputs: directional weekly bias with bull/bear signal count
+
+let weeklyBiasState = null;
+
+async function fetchWeeklyBias() {
+  log('info', '== Weekly Bias analysis starting ==');
+  const alpacaKey    = (process.env.ALPACA_KEY    || process.env.APCA_API_KEY_ID     || '').trim();
+  const alpacaSecret = (process.env.ALPACA_SECRET || process.env.APCA_API_SECRET_KEY || '').trim();
+
+  const checks = []; // { name, value, status: 'bull'|'bear'|'neutral', label, weight }
+  let bullScore = 0, bearScore = 0;
+
+  // Helper: Alpaca daily bars
+  async function getDailyBars(symbol, days) {
+    if (!alpacaKey) return null;
+    const end   = new Date(); end.setMinutes(end.getMinutes() - 20);
+    const start = new Date(); start.setDate(start.getDate() - Math.ceil(days * 1.6));
+    const url   = 'https://data.alpaca.markets/v2/stocks/' + encodeURIComponent(symbol) + '/bars' +
+      '?start=' + encodeURIComponent(start.toISOString()) +
+      '&end='   + encodeURIComponent(end.toISOString()) +
+      '&timeframe=1Day&limit=500&adjustment=raw&feed=iex';
+    const ctrl = new AbortController();
+    const tid  = setTimeout(function() { ctrl.abort(); }, 8000);
+    try {
+      const res = await fetch(url, { signal: ctrl.signal, headers: { 'APCA-API-KEY-ID': alpacaKey, 'APCA-API-SECRET-KEY': alpacaSecret } });
+      clearTimeout(tid);
+      if (!res.ok) return null;
+      const j = await res.json();
+      return (j && j.bars) || null;
+    } catch(e) { clearTimeout(tid); return null; }
+  }
+
+  function smaOf(bars, period) {
+    if (!bars || bars.length < period) return null;
+    var s = 0;
+    for (var i = bars.length - period; i < bars.length; i++) s += bars[i].c;
+    return s / period;
+  }
+
+  // Convert daily bars to weekly (use Friday close / last day of each week)
+  function toWeeklyBars(dailyBars) {
+    if (!dailyBars || !dailyBars.length) return null;
+    var weeks = {};
+    dailyBars.forEach(function(b) {
+      var d = new Date(b.t || b.date || '');
+      // Get Monday of this week as key
+      var day = d.getUTCDay();
+      var monday = new Date(d);
+      monday.setUTCDate(d.getUTCDate() - (day === 0 ? 6 : day - 1));
+      var key = monday.toISOString().slice(0, 10);
+      if (!weeks[key] || new Date(b.t) > new Date(weeks[key].t)) {
+        weeks[key] = b; // keep last bar of the week
+      }
+    });
+    return Object.values(weeks).sort(function(a, b) { return (a.t || a.date) > (b.t || b.date) ? 1 : -1; });
+  }
+
+  // ── Check 1: SPX vs 21-week MA (short-term trend) ─────────────────────────
+  try {
+    const bars = await getDailyBars('SPY', 180); // ~9 months for 21w
+    if (bars && bars.length >= 105) {
+      const weekly = toWeeklyBars(bars);
+      if (weekly && weekly.length >= 21) {
+        const spyNow = weekly[weekly.length - 1].c;
+        const ma21w  = smaOf(weekly, 21);
+        const spxNow = spyNow * 10; // SPX proxy
+        const spxMA  = ma21w * 10;
+        const pct    = ((spyNow - ma21w) / ma21w * 100).toFixed(1);
+        const bull   = parseFloat(pct) > 0;
+        const bear   = parseFloat(pct) < -2;
+        checks.push({
+          name: 'SPX vs 21w MA', value: spxMA.toFixed(0),
+          current: spxNow.toFixed(0), pct,
+          status: bull ? 'bull' : bear ? 'bear' : 'neutral', weight: 2,
+          label: bull
+            ? 'Above 21w MA (' + (pct > 0 ? '+' : '') + pct + '%) — short-term uptrend intact'
+            : bear
+            ? 'Below 21w MA (' + pct + '%) — short-term trend broken, caution'
+            : 'Near 21w MA (' + pct + '%) — at key decision level',
+        });
+        if (bull) bullScore += 2; else if (bear) bearScore += 2;
+        log('info', 'Weekly Bias: SPX vs 21w MA = ' + (pct > 0 ? '+' : '') + pct + '%');
+      }
+    }
+  } catch(e) { log('warn', 'WeeklyBias 21w MA: ' + e.message); }
+
+  // ── Check 2: SPX vs 50-week MA (medium-term trend) ────────────────────────
+  try {
+    const bars = await getDailyBars('SPY', 400); // ~14 months for 50w
+    if (bars && bars.length >= 250) {
+      const weekly = toWeeklyBars(bars);
+      if (weekly && weekly.length >= 50) {
+        const spyNow = weekly[weekly.length - 1].c;
+        const ma50w  = smaOf(weekly, 50);
+        const pct    = ((spyNow - ma50w) / ma50w * 100).toFixed(1);
+        const bull   = parseFloat(pct) > 1;
+        const bear   = parseFloat(pct) < -3;
+        checks.push({
+          name: 'SPX vs 50w MA', value: (ma50w * 10).toFixed(0),
+          current: (spyNow * 10).toFixed(0), pct,
+          status: bull ? 'bull' : bear ? 'bear' : 'neutral', weight: 3,
+          label: bull
+            ? 'Above 50w MA (' + (pct > 0 ? '+' : '') + pct + '%) — medium-term bull trend'
+            : bear
+            ? 'Below 50w MA (' + pct + '%) — medium-term trend damaged, major support lost'
+            : 'Testing 50w MA (' + pct + '%) — critical level, watch closely',
+        });
+        if (bull) bullScore += 3; else if (bear) bearScore += 3;
+        log('info', 'Weekly Bias: SPX vs 50w MA = ' + (pct > 0 ? '+' : '') + pct + '%');
+      }
+    }
+  } catch(e) { log('warn', 'WeeklyBias 50w MA: ' + e.message); }
+
+  // ── Check 3: Weekly higher lows / lower highs structure ───────────────────
+  try {
+    const bars = await getDailyBars('SPY', 120);
+    if (bars && bars.length >= 60) {
+      const weekly = toWeeklyBars(bars);
+      if (weekly && weekly.length >= 8) {
+        const last4 = weekly.slice(-4);
+        const lows  = last4.map(function(b) { return b.l; });
+        const highs = last4.map(function(b) { return b.h; });
+        const higherLows  = lows[3] > lows[0] && lows[2] > lows[0];
+        const lowerHighs  = highs[3] < highs[0] && highs[2] < highs[0];
+        const higherHighs = highs[3] > highs[0];
+        let structLabel, structStatus;
+        if (higherLows && higherHighs) {
+          structLabel = 'Higher highs + higher lows — bullish weekly structure';
+          structStatus = 'bull';
+          bullScore += 2;
+        } else if (higherLows && !lowerHighs) {
+          structLabel = 'Higher lows forming — potential base building, cautiously bullish';
+          structStatus = 'bull';
+          bullScore += 1;
+        } else if (lowerHighs && !higherLows) {
+          structLabel = 'Lower highs pattern — distribution, rallies are sells';
+          structStatus = 'bear';
+          bearScore += 2;
+        } else {
+          structLabel = 'No clear weekly structure — choppy, wait for direction';
+          structStatus = 'neutral';
+        }
+        checks.push({
+          name: 'Weekly Structure', value: higherLows ? 'Higher Lows' : lowerHighs ? 'Lower Highs' : 'Choppy',
+          status: structStatus, weight: 2,
+          label: structLabel,
+        });
+        log('info', 'Weekly Bias: Structure = ' + (higherLows ? 'Higher Lows' : lowerHighs ? 'Lower Highs' : 'Mixed'));
+      }
+    }
+  } catch(e) { log('warn', 'WeeklyBias structure: ' + e.message); }
+
+  // ── Check 4: GEX flip point context (from latest scan) ────────────────────
+  if (gexData && gexData.flipPoint && gexData.spotPrice) {
+    const ptsToFlip = gexData.flipPoint - gexData.spotPrice;
+    const pctToFlip = (ptsToFlip / gexData.spotPrice * 100).toFixed(1);
+    const aboveFlip = gexData.spotPrice > gexData.flipPoint;
+    const netGEX    = gexData.netGEXBillions || 0;
+    const bull = aboveFlip && netGEX > 0;
+    const bear = !aboveFlip && netGEX < -2;
+    checks.push({
+      name: 'GEX Regime', value: gexData.regime,
+      flipPoint: gexData.flipPoint, ptsToFlip: Math.round(ptsToFlip),
+      status: bull ? 'bull' : bear ? 'bear' : 'neutral', weight: 2,
+      label: aboveFlip
+        ? 'Above GEX flip (' + gexData.flipPoint + ') — dealers in pinning mode, upside supported'
+        : 'Below GEX flip (' + gexData.flipPoint + ') — ' + Math.abs(Math.round(ptsToFlip)) + ' pts to reclaim, dealers amplifying moves',
+    });
+    if (bull) bullScore += 2; else if (bear) bearScore += 2;
+  }
+
+  // ── Check 5: CTA trend direction ──────────────────────────────────────────
+  if (ctaState && ctaState.composite !== null) {
+    const c    = ctaState.composite;
+    const d1   = ctaState.compositeDelta1d;
+    const d7   = ctaState.compositeDelta1w;
+    const bull = c > 0 && (d7 === null || d7 >= 0);
+    const bear = c < -25 || (d7 !== null && d7 < -10);
+    const turning = d7 !== null && Math.abs(d7) > 5;
+    checks.push({
+      name: 'CTA Trend', value: (c > 0 ? '+' : '') + c + (d7 !== null ? ' (' + (d7 > 0 ? '+' : '') + d7 + 'w)' : ''),
+      status: bull ? 'bull' : bear ? 'bear' : 'neutral', weight: 2,
+      label: bull
+        ? 'CTA net long and ' + (d7 >= 0 ? 'stable/rising' : 'holding') + ' — trend followers supportive'
+        : bear
+        ? 'CTA ' + (c < -25 ? 'net short' : 'declining sharply') + ' — trend followers pressuring lower'
+        : 'CTA neutral (' + (c > 0 ? '+' : '') + c + ') — no strong mechanical flow either way',
+    });
+    if (bull) bullScore += 2; else if (bear) bearScore += 2;
+  }
+
+  // ── Check 6: VIX trend (is fear rising or falling?) ───────────────────────
+  if (marketHealthState && marketHealthState.signals) {
+    const vixSig = marketHealthState.signals.find(function(s) { return s.name === 'VIX'; });
+    if (vixSig) {
+      checks.push({
+        name: 'VIX', value: vixSig.value,
+        status: vixSig.status, weight: 1,
+        label: vixSig.label,
+      });
+      if (vixSig.status === 'bull') bullScore += 1;
+      else if (vixSig.status === 'bear') bearScore += 1;
+    }
+  }
+
+  // ── Check 7: Credit health ────────────────────────────────────────────────
+  if (marketHealthState && marketHealthState.signals) {
+    const creditSig = marketHealthState.signals.find(function(s) { return s.name.includes('Credit'); });
+    if (creditSig) {
+      checks.push({
+        name: 'Credit', value: creditSig.value,
+        status: creditSig.status, weight: 1,
+        label: creditSig.label,
+      });
+      if (creditSig.status === 'bull') bullScore += 1;
+      else if (creditSig.status === 'bear') bearScore += 1;
+    }
+  }
+
+  // ── Weekly Bias Output ────────────────────────────────────────────────────
+  const totalScore = bullScore + bearScore;
+  const bullPct = totalScore > 0 ? bullScore / totalScore : 0.5;
+
+  let bias, biasColor, biasEmoji, biasDesc, weeklyAction;
+  if (bullPct >= 0.75) {
+    bias = 'STRONG BULL'; biasColor = '#39ff14'; biasEmoji = '🚀';
+    biasDesc = 'Multiple timeframes and signals aligned bullish. High conviction long bias for the week.';
+    weeklyAction = 'Buy dips to GEX support. Target GEX resistance. Size up on pullbacks to key MAs.';
+  } else if (bullPct >= 0.6) {
+    bias = 'LEAN BULL'; biasColor = '#39ff14'; biasEmoji = '📈';
+    biasDesc = 'More bull signals than bear. Lean long but maintain stops at GEX flip.';
+    weeklyAction = 'Long bias. Enter on dips. Stop below GEX flip point. Take partial profits at resistance.';
+  } else if (bullPct >= 0.5) {
+    bias = 'CAUTIOUS BULL'; biasColor = '#ffd166'; biasEmoji = '🟡';
+    biasDesc = 'Mild bull edge. Mixed signals suggest range-bound week. Be selective.';
+    weeklyAction = 'Sell premium at GEX resistance. Small long positions only. Tight stops.';
+  } else if (bullPct <= 0.3) {
+    bias = 'LEAN BEAR'; biasColor = '#ff2d55'; biasEmoji = '📉';
+    biasDesc = 'More bear signals than bull. Lean short or defensive. Rallies are sells.';
+    weeklyAction = 'Fade rallies to GEX resistance. Hold cash. Hedge existing longs. No new longs until GEX flip reclaimed.';
+  } else if (bullPct <= 0.4) {
+    bias = 'CAUTIOUS BEAR'; biasColor = '#ff6b35'; biasEmoji = '⚠';
+    biasDesc = 'More caution than conviction. Risk is to the downside but no strong signal.';
+    weeklyAction = 'Reduce size. Sell calls at GEX resistance. No aggressive shorts yet. Wait for confirmation.';
+  } else {
+    bias = 'NEUTRAL'; biasColor = '#4a6070'; biasEmoji = '⚪';
+    biasDesc = 'Signals evenly split. No clear weekly edge. Trade the range with GEX levels.';
+    weeklyAction = 'Trade GEX levels only. Sell calls at resistance, buy support. No directional bias.';
+  }
+
+  weeklyBiasState = {
+    ts: new Date().toLocaleString('en-US', { timeZone: 'America/Denver', hour12: true }),
+    bias, biasColor, biasEmoji, biasDesc, weeklyAction,
+    bullScore, bearScore,
+    checks,
+  };
+
+  log('ok', '== Weekly Bias: ' + bias + ' (bull:' + bullScore + ' bear:' + bearScore + ') ==');
+  return weeklyBiasState;
 }
 
 // ─── SCHEDULER ────────────────────────────────────────────────────────────────
@@ -2113,6 +2479,8 @@ function startScheduler() {
   cron.schedule('30 16 * * 1-5', function() { runGEXScan('9:30am MST'); });
   // Market Health — every Monday 7:45am MST (before GEX scan)
   cron.schedule('45 14 * * 1', function() { fetchMarketHealth().catch(function(e) { log('warn', 'MarketHealth: ' + e.message); }); });
+  // Weekly Bias — every Monday 7:50am MST (after market health, before GEX scan)
+  cron.schedule('50 14 * * 1', function() { fetchWeeklyBias().catch(function(e) { log('warn', 'WeeklyBias: ' + e.message); }); });
   log('info', 'GEX scheduler started — 8:00am + 9:30am MST weekdays | Market Health: Mondays 7:45am');
 }
 
@@ -2220,6 +2588,70 @@ ${d ? `
   </div>
 </div>
 
+${weeklyBiasState ? `
+<!-- WEEKLY BIAS CARD -->
+<div class="card" style="margin-bottom:16px;border-color:${weeklyBiasState.biasColor}50">
+  <div class="card-head" style="background:${weeklyBiasState.biasColor}12">
+    <span class="card-title" style="color:${weeklyBiasState.biasColor}">${weeklyBiasState.biasEmoji} WEEKLY BIAS — ${weeklyBiasState.bias}</span>
+    <div style="display:flex;align-items:center;gap:8px">
+      <span style="font-size:11px;color:#4a6070">${weeklyBiasState.ts}</span>
+      <button class="btn bs" style="padding:4px 10px;font-size:10px" onclick="refreshWeeklyBias(this)">&#8635;</button>
+    </div>
+  </div>
+  <div style="padding:18px 20px">
+
+    <!-- Bull/Bear score bar -->
+    <div style="margin-bottom:16px">
+      <div style="display:flex;justify-content:space-between;margin-bottom:6px">
+        <div style="font-size:11px;color:#39ff14">BULL ${weeklyBiasState.bullScore}</div>
+        <div style="font-size:13px;font-weight:700;color:${weeklyBiasState.biasColor}">${weeklyBiasState.bias}</div>
+        <div style="font-size:11px;color:#ff2d55">BEAR ${weeklyBiasState.bearScore}</div>
+      </div>
+      <div style="position:relative;height:10px;background:#0d1f2d;border-radius:5px;overflow:hidden">
+        <div style="position:absolute;left:0;top:0;bottom:0;width:${Math.round(weeklyBiasState.bullScore/(weeklyBiasState.bullScore+weeklyBiasState.bearScore||1)*100)}%;background:#39ff14;border-radius:5px 0 0 5px"></div>
+        <div style="position:absolute;right:0;top:0;bottom:0;width:${Math.round(weeklyBiasState.bearScore/(weeklyBiasState.bullScore+weeklyBiasState.bearScore||1)*100)}%;background:#ff2d55;border-radius:0 5px 5px 0"></div>
+      </div>
+    </div>
+
+    <!-- Desc -->
+    <div style="font-size:12px;color:#8aa0b0;margin-bottom:14px">${weeklyBiasState.biasDesc}</div>
+
+    <!-- Checks grid -->
+    <div style="margin-bottom:14px">
+      ${(weeklyBiasState.checks || []).map(function(c) {
+        var col = c.status === 'bull' ? '#39ff14' : c.status === 'bear' ? '#ff2d55' : '#4a6070';
+        var bg  = c.status === 'bull' ? 'rgba(57,255,20,0.05)' : c.status === 'bear' ? 'rgba(255,45,85,0.05)' : 'rgba(255,255,255,0.02)';
+        var icon = c.status === 'bull' ? '✓' : c.status === 'bear' ? '✗' : '~';
+        return '<div style="display:flex;gap:10px;padding:7px 10px;background:' + bg + ';border-radius:6px;margin-bottom:5px;border-left:3px solid ' + col + '">' +
+          '<div style="font-size:13px;font-weight:700;color:' + col + ';width:16px;flex-shrink:0">' + icon + '</div>' +
+          '<div style="flex:1">' +
+            '<div style="font-size:11px;font-weight:600;color:' + col + '">' + c.name +
+              (c.value ? ' <span style="color:#4a6070;font-weight:400">(' + c.value + ')</span>' : '') +
+            '</div>' +
+            '<div style="font-size:10px;color:#8aa0b0;margin-top:1px">' + c.label + '</div>' +
+          '</div>' +
+        '</div>';
+      }).join('')}
+    </div>
+
+    <!-- Weekly action -->
+    <div style="padding:12px 14px;background:${weeklyBiasState.biasColor}15;border-left:4px solid ${weeklyBiasState.biasColor};border-radius:0 8px 8px 0">
+      <div style="font-size:10px;color:#4a6070;letter-spacing:1px;margin-bottom:4px">WEEKLY PLAYBOOK</div>
+      <div style="font-size:12px;font-weight:600;color:${weeklyBiasState.biasColor}">${weeklyBiasState.weeklyAction}</div>
+    </div>
+
+  </div>
+</div>
+` : `
+<div class="card" style="margin-bottom:16px">
+  <div class="card-head">
+    <span class="card-title">&#128200; Weekly Bias</span>
+    <button class="btn bs" style="padding:4px 10px;font-size:10px" onclick="refreshWeeklyBias(this)">&#9654; Run Now</button>
+  </div>
+  <div style="padding:24px;text-align:center;color:#4a6070;font-size:12px">Loading weekly bias... auto-runs Mondays 7:50am MST</div>
+</div>
+`}
+
 ${marketHealthState ? `
 <!-- MARKET HEALTH DASHBOARD -->
 <div class="card" style="margin-bottom:16px;border-color:${marketHealthState.ratingColor}40">
@@ -2258,10 +2690,20 @@ ${marketHealthState ? `
           '<div style="flex:1">' +
             '<div style="font-size:12px;font-weight:600;color:' + col + '">' + s.name + ' <span style="color:#4a6070;font-weight:400;font-size:11px">(' + s.value + ')</span></div>' +
             '<div style="font-size:10px;color:#8aa0b0">' + s.label + '</div>' +
+          (s.extra ? '<div style="font-size:9px;color:#4a6070;margin-top:2px">' + s.extra + '</div>' : '') +
           '</div>' +
         '</div>';
       }).join('')}
     </div>
+
+    ${marketHealthState.corrDesc ? `
+    <!-- Correlation context -->
+    <div style="margin-bottom:10px;padding:8px 12px;background:${marketHealthState.corrStatus === 'bull' ? 'rgba(57,255,20,0.06)' : marketHealthState.corrStatus === 'bear' ? 'rgba(255,45,85,0.06)' : 'rgba(255,255,255,0.03)'};border-radius:6px;border-left:3px solid ${marketHealthState.corrStatus === 'bull' ? '#39ff14' : marketHealthState.corrStatus === 'bear' ? '#ff2d55' : '#4a6070'}">
+      <div style="font-size:10px;color:#4a6070;letter-spacing:1px;margin-bottom:3px">STOCK PICKER SIGNAL (COR1M~)</div>
+      <div style="font-size:11px;font-weight:600;color:${marketHealthState.corrStatus === 'bull' ? '#39ff14' : marketHealthState.corrStatus === 'bear' ? '#ff2d55' : '#ffd166'}">${marketHealthState.corrProxy}</div>
+      <div style="font-size:10px;color:#8aa0b0;margin-top:2px">${marketHealthState.corrDesc}</div>
+    </div>
+    ` : ''}
 
     <!-- Action -->
     <div style="padding:10px 14px;background:${marketHealthState.ratingColor}15;border-left:3px solid ${marketHealthState.ratingColor};border-radius:0 6px 6px 0;font-size:12px;font-weight:600;color:${marketHealthState.ratingColor}">
@@ -3064,6 +3506,13 @@ function scanTicker(btn) {
   .catch(function(e) { msg.textContent = 'Failed: ' + e.message; msg.style.color='#ff2d55'; });
 }
 
+function refreshWeeklyBias(btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Running...'; }
+  fetch('/api/weekly-bias/refresh', { method: 'POST' }).then(function() {
+    setTimeout(function() { location.reload(); }, 12000);
+  }).catch(function() { if (btn) { btn.disabled = false; btn.textContent = '\u21BB'; } });
+}
+
 function refreshHealth(btn) {
   if (btn) { btn.disabled = true; btn.textContent = 'Running...'; }
   fetch('/api/health/refresh', { method: 'POST' }).then(function() {
@@ -3092,6 +3541,18 @@ setTimeout(function() { location.reload(); }, 300000);
 // ─── HTTP SERVER ──────────────────────────────────────────────────────────────
 http.createServer(async function(req, res) {
   const url = req.url.split('?')[0];
+
+  if (req.method === 'GET' && url === '/api/weekly-bias') {
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify(weeklyBiasState || { loading: true }));
+    return;
+  }
+  if (req.method === 'POST' && url === '/api/weekly-bias/refresh') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+    fetchWeeklyBias().catch(function(e) { log('warn', 'WeeklyBias refresh: ' + e.message); });
+    return;
+  }
 
   if (req.method === 'GET' && url === '/api/health') {
     res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
@@ -3231,3 +3692,5 @@ setTimeout(function() { runGEXScan('Startup'); }, 5000);
 startCTAPolling();
 // Run market health 20s after startup
 setTimeout(function() { fetchMarketHealth().catch(function(e) { log('warn', 'MarketHealth startup: ' + e.message); }); }, 20000);
+// Run weekly bias 35s after startup (after market health has data)
+setTimeout(function() { fetchWeeklyBias().catch(function(e) { log('warn', 'WeeklyBias startup: ' + e.message); }); }, 35000);
